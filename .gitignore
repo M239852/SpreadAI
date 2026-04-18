@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# User config — contains personal API keys, bankroll, etc.
+config.json
+
+# Local caches (PrizePicks / ESPN response cache, etc.)
+cache/
+.cache/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Claude Code workspace
+.claude/
+memory/
