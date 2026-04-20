@@ -183,6 +183,81 @@ def _fmt_point(p: float) -> str:
     return f"+{p}" if p > 0 else f"{p}"
 
 
+# --- PrizePicks-style team pick-em ----------------------------------------
+
+# DFS pick-em has no explicit price; we stamp -110 so parlay math still
+# computes a combined probability, but the slip UI switches to the power-play
+# multiplier once the slip is pure-DFS.
+_TEAM_PICK_DEFAULT_AMERICAN = -110
+
+
+def _consensus_point(game: Game, market_key: str, selection: str) -> float | None:
+    """Median point across books for (market, selection) — spreads/totals only."""
+    pts: list[float] = []
+    for bk in game.bookmakers:
+        mk = bk.market(market_key)
+        if not mk:
+            continue
+        for o in mk.outcomes:
+            if o.name.lower() == selection.lower() and o.point is not None:
+                pts.append(float(o.point))
+    if not pts:
+        return None
+    return median(pts)
+
+
+def team_pick_to_leg(
+    game: Game,
+    market_key: str,     # "h2h" | "spreads" | "totals"
+    selection: str,      # team name OR "Over"/"Under"
+) -> LegAnalysis | None:
+    """Build a DFS-flavored LegAnalysis for a team pick-em entry.
+
+    Used by the Team Slip view. The probability is the de-vigged consensus
+    fair probability derived from the sportsbook lines; the price is the
+    flat -110-equivalent that fills the parlay-math shape (the slip panel
+    overrides the payout math with the PrizePicks power-play multiplier
+    whenever the slip is pure-DFS).
+    """
+    fair = compute_fair_prob_from_game(game, market_key, selection)
+    if fair <= 0.0:
+        return None
+
+    point = _consensus_point(game, market_key, selection) if market_key in ("spreads", "totals") else None
+
+    price = _TEAM_PICK_DEFAULT_AMERICAN
+    dec = american_to_decimal(price)
+    book_imp = 1.0 / dec
+    edge = fair - book_imp
+    ev = fair * (dec - 1.0) - (1.0 - fair)
+    b = dec - 1.0
+    kelly = max(0.0, (b * fair - (1.0 - fair)) / b) if b > 0 else 0.0
+
+    selection_label = selection
+    if market_key == "spreads" and point is not None:
+        selection_label = f"{selection} {_fmt_point(point)}"
+    elif market_key == "totals" and point is not None:
+        selection_label = f"{selection} {point}"
+
+    return LegAnalysis(
+        game_id=f"team:{game.id}:{market_key}:{selection.lower()}",
+        sport_title=game.sport_title,
+        matchup=f"{game.away_team} @ {game.home_team}",
+        market=f"team_{market_key}",
+        selection=selection_label,
+        price=price,
+        bookmaker="PrizePicks",
+        point=point,
+        book_implied=book_imp,
+        fair_implied=fair,
+        model_prob=fair,
+        edge=edge,
+        decimal_price=dec,
+        ev_per_dollar=ev,
+        kelly_fraction=kelly,
+    )
+
+
 # --- Parlay math -----------------------------------------------------------
 
 @dataclass
@@ -217,9 +292,12 @@ def analyze_parlay(legs: list[LegAnalysis]) -> ParlayAnalysis:
     ev = combined_prob * (combined_dec - 1.0) - (1.0 - combined_prob)
     b = combined_dec - 1.0
     kelly = max(0.0, (b * combined_prob - (1.0 - combined_prob)) / b) if b > 0 else 0.0
-    # DFS mode detection: triggers when every leg is a pick-em style prop.
+    # DFS mode detection: triggers when every leg is a pick-em style entry —
+    # either a player prop (prop_*) or a team pick-em (team_*), all carried on
+    # a DFS book (PrizePicks / Underdog / demo).
     is_dfs = bool(legs) and all(
-        l.market.startswith("prop_") and l.bookmaker.lower() in ("prizepicks", "underdog", "demo")
+        (l.market.startswith("prop_") or l.market.startswith("team_"))
+        and l.bookmaker.lower() in ("prizepicks", "underdog", "demo")
         for l in legs
     )
     dfs_mult = 0.0
