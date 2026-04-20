@@ -14,6 +14,14 @@ from .betslip_view import BetSlipPanel
 from .settings_view import SettingsView
 from .generator_view import GeneratorView
 from .props_view import PropsView
+from .markets_view import MarketsView
+from .analyzer_view import AnalyzerView
+
+
+# Auto-refresh cadence for live odds polling. The Odds API rate-limits the
+# free tier but 60s is well inside the quota for a single-sport pull and is
+# the lowest interval Realsports.io-class scanners typically use.
+AUTO_REFRESH_MS = 60_000
 
 
 class App(ctk.CTk):
@@ -28,11 +36,14 @@ class App(ctk.CTk):
         self.state_ = AppState(config=load_config())
         self.state_.sport_key = self.state_.config.get("default_sport", "americanfootball_nfl")
 
+        self._auto_refresh_job: str | None = None
+
         self._build_layout()
         self._wire()
 
-        # Initial load
+        # Initial load + kick off the auto-refresh timer
         self.after(200, self.refresh_games)
+        self._schedule_auto_refresh()
 
     # ---------------- Layout ----------------
 
@@ -71,6 +82,8 @@ class App(ctk.CTk):
         self.nav_buttons: dict[str, ctk.CTkButton] = {}
         for key, label, icon in (
             ("games", "Board", "◼"),
+            ("markets", "Markets", "▤"),
+            ("analyzer", "Odds Analyzer", "◈"),
             ("props", "Player Props", "◉"),
             ("generator", "Generator", "✦"),
             ("analysis", "Analysis", "◎"),
@@ -127,6 +140,12 @@ class App(ctk.CTk):
 
         self.games_view = GamesView(self.main, self.state_, self._add_leg, self._view_analysis)
         self.views["games"] = self.games_view
+
+        self.markets_view = MarketsView(self.main, self.state_, self._add_leg)
+        self.views["markets"] = self.markets_view
+
+        self.analyzer_view = AnalyzerView(self.main, self.state_, self._add_leg)
+        self.views["analyzer"] = self.analyzer_view
 
         self.props_view = PropsView(self.main, self.state_, self._add_leg)
         self.views["props"] = self.props_view
@@ -244,3 +263,32 @@ class App(ctk.CTk):
     def _on_settings_saved(self):
         self.status_lbl.configure(text="Settings saved.", text_color=T.POSITIVE)
         self.refresh_games()
+
+    # ---------------- Auto-refresh ----------------
+
+    def _schedule_auto_refresh(self):
+        """Periodic background pull so Markets / Analyzer stay current.
+
+        Only fires when an API key is configured — otherwise we'd just be
+        reshuffling demo data. `self.after` returns a job handle which we
+        hang onto so `_cancel_auto_refresh` can kill it on exit.
+        """
+        self._auto_refresh_job = self.after(AUTO_REFRESH_MS, self._auto_refresh_tick)
+
+    def _auto_refresh_tick(self):
+        cfg = self.state_.config
+        if cfg.get("odds_api_key"):
+            self.refresh_games()
+        self._schedule_auto_refresh()
+
+    def _cancel_auto_refresh(self):
+        if self._auto_refresh_job is not None:
+            try:
+                self.after_cancel(self._auto_refresh_job)
+            except Exception:
+                pass
+            self._auto_refresh_job = None
+
+    def destroy(self):
+        self._cancel_auto_refresh()
+        super().destroy()
