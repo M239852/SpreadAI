@@ -17,6 +17,7 @@ from .props_view import PropsView
 from .markets_view import MarketsView
 from .analyzer_view import AnalyzerView
 from .team_slip_view import TeamSlipView
+from .prop_generator_view import PropGeneratorView
 
 
 # Auto-refresh cadence for live odds polling. The Odds API rate-limits the
@@ -87,6 +88,7 @@ class App(ctk.CTk):
             ("analyzer", "Odds Analyzer", "◈"),
             ("team_slip", "Team Slip", "◆"),
             ("props", "Player Props", "◉"),
+            ("prop_generator", "Prop Generator", "✧"),
             ("generator", "Generator", "✦"),
             ("analysis", "Analysis", "◎"),
             ("settings", "Settings", "⚙"),
@@ -154,6 +156,9 @@ class App(ctk.CTk):
 
         self.props_view = PropsView(self.main, self.state_, self._add_leg)
         self.views["props"] = self.props_view
+
+        self.prop_generator_view = PropGeneratorView(self.main, self.state_, self._add_leg)
+        self.views["prop_generator"] = self.prop_generator_view
 
         self.generator_view = GeneratorView(self.main, self.state_, self._add_leg)
         self.views["generator"] = self.generator_view
