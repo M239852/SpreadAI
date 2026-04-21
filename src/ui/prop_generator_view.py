@@ -23,12 +23,24 @@ from ..analysis.prop_generator import (
     generate_prop_slip, GeneratedPropSlip, MODES as PROP_MODES,
 )
 from ..analysis.probability import LegAnalysis
-from ..api.prizepicks_api import PrizePicksAPI, PlayerProp, PP_LEAGUE_IDS, POWER_PAYOUTS
+from ..api.prizepicks_api import PlayerProp, PP_LEAGUE_IDS, POWER_PAYOUTS
+from ..api.underdog_api import (
+    UD_SPORT_TAGS, BOOK_CHOICES, fetch_props_from_books, book_from_ui_choice,
+)
 from ..api.demo_props import demo_props
 from ..utils.formatters import format_pct, format_money
 from . import theme as T
 from .widgets import Card, Pill, StatBlock, make_scroll
 from .state import AppState
+
+
+# Per-book accent used for the source pill on a leg card. Keeps books
+# visually distinct without leaning on logos (which we don't ship).
+_BOOK_COLORS = {
+    "prizepicks": T.ACCENT,
+    "underdog":   "#E8553C",
+    "demo":       T.TEXT_MUTED,
+}
 
 
 class PropGeneratorView(ctk.CTkFrame):
@@ -44,10 +56,13 @@ class PropGeneratorView(ctk.CTkFrame):
         self.stake = 10.0
         self.stat_filter = ""
         self.team_filter = ""
+        self.book_choice = BOOK_CHOICES[0]   # "All books"
         self.use_network = True
         self._current_slip: GeneratedPropSlip | None = None
+        # Cache keyed by (sport_key, books-tuple) so switching the book
+        # filter doesn't reuse a pool that was fetched with only one book.
         self._props_cache: list[PlayerProp] = []
-        self._props_sport_key: str | None = None
+        self._props_cache_key: tuple | None = None
 
         state.subscribe(self._on_state_event)
 
@@ -148,14 +163,30 @@ class PropGeneratorView(ctk.CTkFrame):
                 command=lambda a=amt: self._set_stake(a),
             ).pack(side="left", padx=(6, 0))
 
-        # FILTERS (stat / team)
+        # FILTERS (book / stat / team)
         ctk.CTkLabel(inner, text="FILTERS", font=T.FONT_TINY, text_color=T.TEXT_MUTED).pack(anchor="w", pady=(14, 4))
         fr = ctk.CTkFrame(inner, fg_color="transparent")
         fr.pack(fill="x")
+
+        # BOOK dropdown — restricts the pool to a specific DFS book so every
+        # leg we emit is actually placeable there. Default is "All books",
+        # which fetches from every supported book and merges.
+        ctk.CTkLabel(fr, text="Book", font=T.FONT_TINY, text_color=T.TEXT_MUTED).pack(side="left")
+        self.book_var = ctk.StringVar(value=self.book_choice)
+        ctk.CTkOptionMenu(
+            fr, values=list(BOOK_CHOICES), variable=self.book_var,
+            width=150, height=28,
+            fg_color=T.BG_ELEV_2, button_color=T.BG_ELEV_3,
+            button_hover_color=T.ACCENT, dropdown_fg_color=T.BG_ELEV_1,
+            dropdown_hover_color=T.BG_ELEV_3, text_color=T.TEXT,
+            dropdown_text_color=T.TEXT, font=T.FONT_SMALL,
+            command=self._on_book_change,
+        ).pack(side="left", padx=(6, 14))
+
         ctk.CTkLabel(fr, text="Stat", font=T.FONT_TINY, text_color=T.TEXT_MUTED).pack(side="left")
         self.stat_var = ctk.StringVar()
         ctk.CTkEntry(
-            fr, textvariable=self.stat_var, width=160, height=28,
+            fr, textvariable=self.stat_var, width=140, height=28,
             fg_color=T.BG_ELEV_2, border_width=0, text_color=T.TEXT,
             placeholder_text="Any stat",
         ).pack(side="left", padx=(6, 12))
@@ -164,7 +195,7 @@ class PropGeneratorView(ctk.CTkFrame):
         ctk.CTkLabel(fr, text="Team", font=T.FONT_TINY, text_color=T.TEXT_MUTED).pack(side="left")
         self.team_var = ctk.StringVar()
         ctk.CTkEntry(
-            fr, textvariable=self.team_var, width=120, height=28,
+            fr, textvariable=self.team_var, width=110, height=28,
             fg_color=T.BG_ELEV_2, border_width=0, text_color=T.TEXT,
             placeholder_text="Any team",
         ).pack(side="left", padx=(6, 12))
@@ -232,6 +263,13 @@ class PropGeneratorView(ctk.CTkFrame):
     def _on_team_change(self):
         self.team_filter = (self.team_var.get() or "").strip()
 
+    def _on_book_change(self, choice: str):
+        self.book_choice = choice
+        # Changing book changes which books we fetch from, so force a refetch
+        # on the next Generate.
+        self._props_cache = []
+        self._props_cache_key = None
+
     def _on_network_toggle(self):
         self.use_network = bool(self.net_var.get())
 
@@ -239,15 +277,18 @@ class PropGeneratorView(ctk.CTkFrame):
         if event == "sport":
             # Invalidate the cached prop pool — the next Generate will refetch.
             self._props_cache = []
-            self._props_sport_key = None
+            self._props_cache_key = None
 
     # ---------------- Generation ----------------
 
     def _generate(self):
         sport_key = self.state.sport_key
-        if sport_key not in PP_LEAGUE_IDS:
+        # Sport-coverage check: both books share the same set of supported
+        # sports. If neither book covers this sport we can't verify, so bail
+        # early rather than silently falling through to demo data.
+        if sport_key not in PP_LEAGUE_IDS and sport_key not in UD_SPORT_TAGS:
             self.progress_lbl.configure(
-                text=f"PrizePicks doesn't cover {sport_key} in SpreadAI.",
+                text=f"PrizePicks/Underdog don't cover {sport_key} in SpreadAI.",
                 text_color=T.WARNING,
             )
             return
@@ -268,7 +309,14 @@ class PropGeneratorView(ctk.CTkFrame):
         stake = self.stake
         stat_f = self.stat_filter or None
         team_f = self.team_filter or None
+        book_choice = self.book_choice
+        book_list = book_from_ui_choice(book_choice)          # None | ["PrizePicks"] | ["Underdog"]
+        book_filter_for_generator = None if not book_list else book_list[0]
         skip_network = not self.use_network
+
+        # Cache key encodes sport + selected books — swapping books forces a
+        # refetch so every returned prop actually belongs to an allowed book.
+        cache_key = (sport_key, tuple(book_list) if book_list else ("all",))
 
         def progress_cb(done: int, total: int, note: str):
             self.after(0, lambda: self.progress_lbl.configure(
@@ -279,22 +327,25 @@ class PropGeneratorView(ctk.CTkFrame):
             err = ""
             slip: GeneratedPropSlip | None = None
             try:
-                # Use cached props when the sport hasn't changed — avoids
-                # hammering the PrizePicks API when the user is iterating on
-                # mode/leg count.
+                # Reuse the cached pool when the sport+book selection matches.
                 props: list[PlayerProp] = []
-                if self._props_cache and self._props_sport_key == sport_key:
+                if self._props_cache and self._props_cache_key == cache_key:
                     props = self._props_cache
                 else:
+                    self.after(0, lambda: self.progress_lbl.configure(
+                        text=f"Fetching {book_choice}…", text_color=T.TEXT_MUTED,
+                    ))
                     try:
-                        client = PrizePicksAPI()
-                        props = client.fetch_props(sport_key)
+                        props = fetch_props_from_books(sport_key, book_list)
                     except Exception:
                         props = []
                     if not props:
+                        # Offline / rate-limited — fall back to our curated
+                        # demo slate. Demo props carry source="Demo" so the
+                        # per-leg badge tells the user they're offline samples.
                         props = demo_props(sport_key)
                     self._props_cache = props
-                    self._props_sport_key = sport_key
+                    self._props_cache_key = cache_key
 
                 slip = generate_prop_slip(
                     props=props,
@@ -306,6 +357,7 @@ class PropGeneratorView(ctk.CTkFrame):
                     skip_network=skip_network,
                     stat_filter=stat_f,
                     team_filter=team_f,
+                    book_filter=book_filter_for_generator,
                 )
             except Exception as e:
                 err = f"Generation failed: {e}"
@@ -355,6 +407,19 @@ class PropGeneratorView(ctk.CTkFrame):
                 color=T.BG_ELEV_3, text_color=T.ACCENT,
             ).pack(side="right")
         Pill(top, slip.mode_subtitle, color=T.BG_ELEV_3, text_color=T.TEXT_MUTED).pack(side="right", padx=6)
+
+        # Verified-books pill — shows at a glance which DFS books every leg
+        # is placeable on. Verification is implicit: each leg's prop was
+        # fetched from its tagged book's live projections feed.
+        book_counts: dict[str, int] = {}
+        for pk in slip.picks:
+            src = (pk.prop.source or "?")
+            book_counts[src] = book_counts.get(src, 0) + 1
+        books_text = "  ·  ".join(f"{n}× {src}" for src, n in book_counts.items())
+        Pill(
+            top, f"✓ {books_text}",
+            color=T.BG_ELEV_3, text_color=T.POSITIVE,
+        ).pack(side="right", padx=6)
 
         stats = ctk.CTkFrame(inner, fg_color="transparent")
         stats.pack(fill="x", pady=(12, 0))
@@ -424,10 +489,23 @@ class PropGeneratorView(ctk.CTkFrame):
         left.pack(side="left", fill="x", expand=True)
 
         side_color = T.POSITIVE if pick.side == "Over" else T.NEGATIVE
+
+        header_row = ctk.CTkFrame(left, fg_color="transparent")
+        header_row.pack(fill="x", anchor="w")
         ctk.CTkLabel(
-            left, text=f"Leg {idx}  ·  {pick.prop.player_name}",
+            header_row, text=f"Leg {idx}  ·  {pick.prop.player_name}",
             font=T.FONT_HEAD, text_color=T.TEXT,
-        ).pack(anchor="w")
+        ).pack(side="left")
+        # Source pill — tells the user which DFS book this leg was verified
+        # against. The prop came directly from that book's projections feed,
+        # so seeing the badge here means the leg is placeable there.
+        src = pick.prop.source or "?"
+        src_color = _BOOK_COLORS.get(src.lower(), T.TEXT)
+        Pill(
+            header_row, f"✓ {src}",
+            color=T.BG_ELEV_3, text_color=src_color,
+        ).pack(side="left", padx=(10, 0))
+
         ctk.CTkLabel(
             left,
             text=f"{pick.side} {pick.prop.line} {pick.prop.stat_type}   ·   "

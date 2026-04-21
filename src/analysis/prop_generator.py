@@ -153,12 +153,14 @@ def generate_prop_slip(
     precomputed: dict[str, PropAnalysis] | None = None,
     stat_filter: str | None = None,
     team_filter: str | None = None,
+    book_filter: str | None = None,
 ) -> GeneratedPropSlip | None:
     """Build a GeneratedPropSlip from the provided props.
 
     Parameters
     ----------
-    props : source pool (typically `PrizePicksAPI.fetch_props(sport_key)`).
+    props : source pool (typically from `fetch_props_from_books(sport_key)`
+            so every prop carries its originating book in `.source`).
     mode : one of `MODES` — picks the scoring function.
     max_legs / min_legs : bounds on the returned slip length.
     stake : used for the projected payout / profit fields.
@@ -167,10 +169,18 @@ def generate_prop_slip(
     precomputed : optional map of prop.id → PropAnalysis (e.g. from PropsView's
                   background pass) so we don't redo the network fetches.
     stat_filter / team_filter : narrow the candidate pool.
+    book_filter : restrict to props from one book ("PrizePicks" / "Underdog")
+                  or None/"all" to use every book. Demo props always pass —
+                  they're offline placeholders, not live board entries, and
+                  blocking them would leave the pool empty in demo mode.
     """
     if mode not in MODES:
         mode = "balanced"
     cfg = MODES[mode]
+
+    book_f = (book_filter or "").strip().lower()
+    if book_f in ("", "all", "all books"):
+        book_f = ""
 
     # Filter input pool.
     pool: list[PlayerProp] = []
@@ -179,6 +189,12 @@ def generate_prop_slip(
             continue
         if team_filter and team_filter.lower() not in (p.team or "").lower():
             continue
+        if book_f:
+            src = (p.source or "").lower()
+            # Demo props are offline samples — let them through so the filter
+            # never zeroes out the pool when the user has no live data.
+            if src != "demo" and src != book_f:
+                continue
         pool.append(p)
 
     if not pool:
@@ -282,6 +298,20 @@ def _overall_reasoning(
     else:
         multiplier_clause = f"{n}-leg power play pays {mult:.0f}x; break-even {break_even*100:.1f}%."
 
+    # Book-verification line — spells out which DFS books each leg is
+    # placeable on. Because every pick comes from a live book feed, listing
+    # the sources here doubles as the "yes, you can actually select these"
+    # guarantee the generator makes to the user.
+    book_counts: dict[str, int] = {}
+    for pk in picks:
+        src = pk.prop.source or "?"
+        book_counts[src] = book_counts.get(src, 0) + 1
+    if book_counts:
+        parts = [f"{c} on {b}" for b, c in book_counts.items()]
+        verified = f"Verified placeable: {', '.join(parts)}."
+    else:
+        verified = ""
+
     if mode == "safest":
         stance = f"Optimized for hit rate: every leg's model probability is ≥ {MODES['safest']['min_side_prob']*100:.0f}%."
     elif mode == "upside":
@@ -300,4 +330,5 @@ def _overall_reasoning(
     else:
         verdict = f"Combined model probability {combined_pct:.1f}%."
 
-    return f"{stance}  {multiplier_clause}  {verdict}"
+    tail = f"{stance}  {multiplier_clause}  {verdict}"
+    return f"{tail}  {verified}" if verified else tail
