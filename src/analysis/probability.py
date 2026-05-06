@@ -183,12 +183,29 @@ def _fmt_point(p: float) -> str:
     return f"+{p}" if p > 0 else f"{p}"
 
 
-# --- PrizePicks-style team pick-em ----------------------------------------
+# --- DFS / prediction-market team pick-em ---------------------------------
 
-# DFS pick-em has no explicit price; we stamp -110 so parlay math still
-# computes a combined probability, but the slip UI switches to the power-play
-# multiplier once the slip is pure-DFS.
+# DFS pick-em (PrizePicks / Underdog) has no explicit price; we stamp -110 so
+# parlay math still computes a combined probability, but the slip UI switches
+# to the power-play multiplier once the slip is pure-DFS. Kalshi is different:
+# it's a prediction-market exchange where each "yes" contract trades at a
+# market price between $0.01 and $0.99. We don't have Kalshi order-book data,
+# so for Kalshi legs we use the de-vigged consensus probability AS the implied
+# yes price — i.e. fair, no-vig parlay math. That keeps Kalshi out of the DFS
+# allowlist (so analyze_parlay falls through to regular parlay math) and gives
+# the user a head-to-head comparison against the PrizePicks/Underdog payout.
 _TEAM_PICK_DEFAULT_AMERICAN = -110
+
+# Platforms supported by team_pick_to_leg. The string is what gets stamped onto
+# `LegAnalysis.bookmaker`, which is also what the bet slip's DFS detection
+# inspects. Keep these lower-cased for the lookup; the bookmaker label is
+# title-cased separately so it renders nicely.
+TEAM_PLATFORMS: tuple[str, ...] = ("prizepicks", "underdog", "kalshi")
+_PLATFORM_LABEL: dict[str, str] = {
+    "prizepicks": "PrizePicks",
+    "underdog":   "Underdog",
+    "kalshi":     "Kalshi",
+}
 
 
 def _consensus_point(game: Game, market_key: str, selection: str) -> float | None:
@@ -210,23 +227,50 @@ def team_pick_to_leg(
     game: Game,
     market_key: str,     # "h2h" | "spreads" | "totals"
     selection: str,      # team name OR "Over"/"Under"
+    platform: str = "prizepicks",
 ) -> LegAnalysis | None:
     """Build a DFS-flavored LegAnalysis for a team pick-em entry.
 
     Used by the Team Slip view. The probability is the de-vigged consensus
-    fair probability derived from the sportsbook lines; the price is the
-    flat -110-equivalent that fills the parlay-math shape (the slip panel
-    overrides the payout math with the PrizePicks power-play multiplier
-    whenever the slip is pure-DFS).
+    fair probability derived from the sportsbook lines; the rest of the leg's
+    shape depends on `platform`:
+
+        prizepicks / underdog : flat -110 price. analyze_parlay's DFS detector
+            recognizes both bookmakers and switches the bet slip to the
+            power-play multiplier ladder (3x / 5x / 10x / 20x / 25x for 2..6
+            legs). The math here is just a placeholder so the parlay container
+            still computes a combined probability.
+        kalshi : we use the de-vigged fair probability AS the implied yes
+            contract price (decimal_price = 1/fair). Kalshi is intentionally
+            absent from analyze_parlay's DFS allowlist, so the bet slip falls
+            through to regular parlay math — which on a Kalshi-only slip
+            yields the no-vig combined payout the user would actually get if
+            every yes contract priced at consensus fair value.
+
+    Returns None if no consensus fair probability is available for the pick.
     """
+    platform_key = (platform or "prizepicks").strip().lower()
+    if platform_key not in TEAM_PLATFORMS:
+        platform_key = "prizepicks"
+    bookmaker_label = _PLATFORM_LABEL[platform_key]
+
     fair = compute_fair_prob_from_game(game, market_key, selection)
     if fair <= 0.0:
         return None
 
     point = _consensus_point(game, market_key, selection) if market_key in ("spreads", "totals") else None
 
-    price = _TEAM_PICK_DEFAULT_AMERICAN
-    dec = american_to_decimal(price)
+    if platform_key == "kalshi":
+        # Yes-contract pricing: the user pays `fair` cents per $1 payout, so
+        # the decimal price is 1/fair. Clamp to a sane range so we never
+        # produce a degenerate American conversion if fair is at the rails.
+        fair_clamped = max(0.01, min(0.99, fair))
+        dec = 1.0 / fair_clamped
+        from ..utils.formatters import decimal_to_american
+        price = decimal_to_american(dec)
+    else:
+        price = _TEAM_PICK_DEFAULT_AMERICAN
+        dec = american_to_decimal(price)
     book_imp = 1.0 / dec
     edge = fair - book_imp
     ev = fair * (dec - 1.0) - (1.0 - fair)
@@ -246,7 +290,7 @@ def team_pick_to_leg(
         market=f"team_{market_key}",
         selection=selection_label,
         price=price,
-        bookmaker="PrizePicks",
+        bookmaker=bookmaker_label,
         point=point,
         book_implied=book_imp,
         fair_implied=fair,

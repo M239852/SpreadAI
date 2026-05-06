@@ -3,12 +3,18 @@ import threading
 from typing import Callable
 import customtkinter as ctk
 
-from ..analysis.generator import generate_slip, GeneratedSlip, MODES
+from ..analysis.generator import generate_slips, GeneratedSlip, MODES
 from ..analysis.probability import LegAnalysis
 from ..utils.formatters import format_american, format_pct, format_money
 from . import theme as T
 from .widgets import Card, Pill, StatBlock, make_scroll, hsep
 from .state import AppState
+
+
+# Multi-slip cap. Five is enough for most slates and keeps UI render time
+# bounded. Bumping this past ~5 also tends to push slip quality off a cliff
+# because the per-game pool exhausts quickly.
+SLIP_COUNT_CHOICES = (1, 2, 3, 4, 5)
 
 
 class GeneratorView(ctk.CTkFrame):
@@ -22,8 +28,10 @@ class GeneratorView(ctk.CTkFrame):
         self.on_add_leg = on_add_leg
         self.mode = "balanced"
         self.max_legs = 4
+        self.slip_count = 1
+        self.dedupe_legs = True
         self.bookmaker_filter: str | None = None
-        self._current_slip: GeneratedSlip | None = None
+        self._current_slips: list[GeneratedSlip] = []
 
         state.subscribe(self._on_state_event)
 
@@ -93,6 +101,31 @@ class GeneratorView(ctk.CTkFrame):
         self.legs_slider.set(self.max_legs)
         self.legs_slider.pack(side="left", padx=12)
 
+        # SLIPS — how many independent slips to generate in one click. With
+        # the dedup toggle on (default), each slip's exact picks are excluded
+        # from the next slip's candidate pool.
+        ctk.CTkLabel(inner, text="SLIPS", font=T.FONT_TINY, text_color=T.TEXT_MUTED).pack(anchor="w", pady=(14, 4))
+        slips_row = ctk.CTkFrame(inner, fg_color="transparent")
+        slips_row.pack(fill="x")
+        self.slip_buttons: dict[int, ctk.CTkButton] = {}
+        for n in SLIP_COUNT_CHOICES:
+            b = ctk.CTkButton(
+                slips_row, text=str(n), width=44, height=32,
+                fg_color=T.BG_ELEV_2, hover_color=T.BG_ELEV_3, text_color=T.TEXT,
+                font=T.FONT_BOLD, corner_radius=8,
+                command=lambda k=n: self._pick_slip_count(k),
+            )
+            b.pack(side="left", padx=(0, 6))
+            self.slip_buttons[n] = b
+        self._highlight_slip_count()
+        self.dedupe_var = ctk.BooleanVar(value=self.dedupe_legs)
+        ctk.CTkSwitch(
+            slips_row, text="Unique legs across slips",
+            variable=self.dedupe_var, font=T.FONT_SMALL, text_color=T.TEXT_MUTED,
+            progress_color=T.ACCENT, button_color=T.TEXT, button_hover_color=T.TEXT,
+            command=self._on_dedupe_toggle,
+        ).pack(side="left", padx=(16, 0))
+
         ctk.CTkLabel(inner, text="SPORTSBOOK", font=T.FONT_TINY, text_color=T.TEXT_MUTED).pack(anchor="w", pady=(14, 4))
         book_row = ctk.CTkFrame(inner, fg_color="transparent")
         book_row.pack(fill="x")
@@ -140,6 +173,20 @@ class GeneratorView(ctk.CTkFrame):
     def _on_legs_change(self, val: float):
         self.max_legs = int(round(val))
         self.legs_val.configure(text=f"Max legs: {self.max_legs}")
+
+    def _pick_slip_count(self, n: int):
+        self.slip_count = n
+        self._highlight_slip_count()
+
+    def _highlight_slip_count(self):
+        for n, b in self.slip_buttons.items():
+            if n == self.slip_count:
+                b.configure(fg_color=T.ACCENT, text_color=T.BG)
+            else:
+                b.configure(fg_color=T.BG_ELEV_2, text_color=T.TEXT)
+
+    def _on_dedupe_toggle(self):
+        self.dedupe_legs = bool(self.dedupe_var.get())
 
     def _on_book_change(self, label: str):
         self.bookmaker_filter = None if label == self.ALL_BOOKS_LABEL else label
@@ -191,34 +238,38 @@ class GeneratorView(ctk.CTkFrame):
             ))
 
         book = self.bookmaker_filter
+        slip_count = self.slip_count
+        dedupe = self.dedupe_legs
 
         def work():
-            slip: GeneratedSlip | None = None
+            slips: list[GeneratedSlip] = []
             err = ""
             try:
-                slip = generate_slip(
+                slips = generate_slips(
                     games=games,
                     mode=self.mode,
                     max_legs=self.max_legs,
                     min_legs=2,
+                    count=slip_count,
+                    dedupe_legs=dedupe,
                     progress_cb=progress_cb,
                     bookmaker_filter=book,
                 )
             except Exception as e:
                 err = f"Generation failed: {e}"
-            self.after(0, lambda: self._on_generated(slip, err, loading))
+            self.after(0, lambda: self._on_generated(slips, err, loading))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_generated(self, slip: GeneratedSlip | None, err: str, loading_widget):
+    def _on_generated(self, slips: list[GeneratedSlip], err: str, loading_widget):
         loading_widget.destroy()
         self.generate_btn.configure(state="normal", text="Generate slip")
-        self._current_slip = slip
+        self._current_slips = slips
 
         if err:
             self.progress_lbl.configure(text=err, text_color=T.NEGATIVE)
             return
-        if slip is None:
+        if not slips:
             hint = (
                 f"No qualifying legs found on {self.bookmaker_filter}. "
                 "Try All books or a different mode."
@@ -228,13 +279,41 @@ class GeneratorView(ctk.CTkFrame):
             self.progress_lbl.configure(text=hint, text_color=T.WARNING)
             return
         book_note = f" · {self.bookmaker_filter} only" if self.bookmaker_filter else ""
-        self.progress_lbl.configure(
-            text=f"Built a {len(slip.legs)}-leg {slip.mode_label} slip{book_note}.",
-            text_color=T.POSITIVE,
-        )
-        self._render_slip(slip)
+        if len(slips) < self.slip_count:
+            # The pool ran out before producing every requested slip — tell the
+            # user explicitly so they can flip dedup off or widen the slate.
+            short_note = (
+                f" (asked for {self.slip_count}, slate only supported {len(slips)})"
+            )
+            color = T.WARNING
+        else:
+            short_note = ""
+            color = T.POSITIVE
+        if len(slips) == 1:
+            text = f"Built a {len(slips[0].legs)}-leg {slips[0].mode_label} slip{book_note}{short_note}."
+        else:
+            total_legs = sum(len(s.legs) for s in slips)
+            text = (
+                f"Built {len(slips)} {slips[0].mode_label} slips · {total_legs} legs total"
+                f"{book_note}{short_note}."
+            )
+        self.progress_lbl.configure(text=text, text_color=color)
+        for idx, slip in enumerate(slips, start=1):
+            self._render_slip(slip, slip_index=idx, total_slips=len(slips))
 
-    def _render_slip(self, slip: GeneratedSlip):
+    def _render_slip(self, slip: GeneratedSlip, slip_index: int = 1, total_slips: int = 1):
+        # When multiple slips are present, lead with a divider + slip-N label
+        # so the user can scan slip boundaries at a glance.
+        if total_slips > 1:
+            divider = ctk.CTkFrame(
+                self.results_frame, fg_color=T.BORDER, height=1,
+            )
+            divider.pack(fill="x", pady=(18 if slip_index > 1 else 6, 4))
+            ctk.CTkLabel(
+                self.results_frame, text=f"SLIP {slip_index} OF {total_slips}",
+                font=T.FONT_TINY, text_color=T.TEXT_MUTED, anchor="w",
+            ).pack(anchor="w", padx=8, pady=(0, 2))
+
         # Header card — mode + stats
         head = Card(self.results_frame)
         head.pack(fill="x", pady=8)
@@ -243,7 +322,12 @@ class GeneratorView(ctk.CTkFrame):
 
         top = ctk.CTkFrame(inner, fg_color="transparent")
         top.pack(fill="x")
-        ctk.CTkLabel(top, text=f"{slip.mode_label}  ·  {len(slip.legs)} legs",
+        title = (
+            f"{slip.mode_label}  ·  {len(slip.legs)} legs"
+            if total_slips == 1
+            else f"Slip {slip_index}  ·  {slip.mode_label}  ·  {len(slip.legs)} legs"
+        )
+        ctk.CTkLabel(top, text=title,
                      font=T.FONT_TITLE, text_color=T.TEXT).pack(side="left")
         Pill(top, slip.mode_subtitle, color=T.BG_ELEV_3, text_color=T.ACCENT).pack(side="right")
         if self.bookmaker_filter:
@@ -280,14 +364,20 @@ class GeneratorView(ctk.CTkFrame):
             font=T.FONT_SMALL, text_color=T.TEXT, justify="left", wraplength=860,
         ).pack(anchor="w", pady=(6, 0))
 
-        # Action row
+        # Action row — Apply replaces the entire bet slip with this slip's
+        # legs. Each rendered slip gets its own button so the user can compare
+        # multi-slip output and pick whichever they want to load.
         action = ctk.CTkFrame(self.results_frame, fg_color="transparent")
         action.pack(fill="x", pady=(4, 8))
+        apply_label = (
+            "Apply slip to bet slip" if total_slips == 1
+            else f"Apply slip {slip_index} to bet slip"
+        )
         ctk.CTkButton(
-            action, text="Apply slip to bet slip", height=36, width=220,
+            action, text=apply_label, height=36, width=240,
             fg_color=T.ACCENT, hover_color=T.ACCENT_HOVER, text_color=T.BG,
             font=T.FONT_BOLD, corner_radius=8,
-            command=lambda: self._apply_to_slip(slip),
+            command=lambda s=slip: self._apply_to_slip(s),
         ).pack(side="left")
 
         # Per-leg breakdown

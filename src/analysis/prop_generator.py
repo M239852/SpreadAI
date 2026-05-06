@@ -72,6 +72,10 @@ class GeneratedPropSlip:
     projected_profit: float = 0.0
     ev_dollars: float = 0.0
     overall_reasoning: str = ""
+    # Stable per-pick exclusion keys (prop ids). The multi-slip wrapper
+    # `generate_prop_slips` accumulates these so subsequent slips never
+    # repeat the same prop pick when dedup is enabled.
+    pick_keys: list[str] = field(default_factory=list)
 
 
 # ----------------------- Core assembly --------------------------------------
@@ -154,6 +158,7 @@ def generate_prop_slip(
     stat_filter: str | None = None,
     team_filter: str | None = None,
     book_filter: str | None = None,
+    exclude_prop_ids: set[str] | None = None,
 ) -> GeneratedPropSlip | None:
     """Build a GeneratedPropSlip from the provided props.
 
@@ -182,9 +187,13 @@ def generate_prop_slip(
     if book_f in ("", "all", "all books"):
         book_f = ""
 
+    excluded_ids = exclude_prop_ids or set()
+
     # Filter input pool.
     pool: list[PlayerProp] = []
     for p in props:
+        if p.id and p.id in excluded_ids:
+            continue
         if stat_filter and stat_filter.lower() not in p.stat_type.lower():
             continue
         if team_filter and team_filter.lower() not in (p.team or "").lower():
@@ -284,7 +293,64 @@ def generate_prop_slip(
         projected_profit=profit,
         ev_dollars=ev_dollars,
         overall_reasoning=_overall_reasoning(mode, chosen, parlay, mult, break_even),
+        pick_keys=[pk.prop.id for pk in chosen if pk.prop.id],
     )
+
+
+# --- Multi-slip orchestration ---------------------------------------------
+
+def generate_prop_slips(
+    props: list[PlayerProp],
+    mode: str = "balanced",
+    max_legs: int = 3,
+    min_legs: int = 2,
+    stake: float = 10.0,
+    count: int = 1,
+    dedupe_legs: bool = True,
+    progress_cb: Callable[[int, int, str], None] | None = None,
+    *,
+    skip_network: bool = False,
+    precomputed: dict[str, PropAnalysis] | None = None,
+    stat_filter: str | None = None,
+    team_filter: str | None = None,
+    book_filter: str | None = None,
+) -> list[GeneratedPropSlip]:
+    """Generate up to `count` prop slips back-to-back.
+
+    Mirrors `generator.generate_slips` for player props. With `dedupe_legs`
+    on (the default), each slip's prop ids are excluded from the pool used
+    by later slips. Stops early when the pool can't produce another slip
+    (returns the slips it managed to build).
+
+    With `dedupe_legs` off no exclusion is applied — slips will collide
+    because the underlying ranker is deterministic. That's the explicit
+    behavior of the toggle.
+    """
+    if count <= 0:
+        return []
+    excluded: set[str] = set()
+    out: list[GeneratedPropSlip] = []
+    for i in range(count):
+        slip = generate_prop_slip(
+            props=props,
+            mode=mode,
+            max_legs=max_legs,
+            min_legs=min_legs,
+            stake=stake,
+            progress_cb=progress_cb if i == 0 else None,
+            skip_network=skip_network,
+            precomputed=precomputed,
+            stat_filter=stat_filter,
+            team_filter=team_filter,
+            book_filter=book_filter,
+            exclude_prop_ids=excluded if dedupe_legs else None,
+        )
+        if slip is None:
+            break
+        out.append(slip)
+        if dedupe_legs:
+            excluded.update(slip.pick_keys)
+    return out
 
 
 def _overall_reasoning(

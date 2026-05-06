@@ -23,10 +23,11 @@ from typing import Callable
 
 from ..analysis.probability import (
     team_pick_to_leg, compute_fair_prob_from_game, LegAnalysis, _consensus_point,
+    analyze_parlay,
 )
 from ..api.odds_api import Game, SPORT_LABELS
 from ..api.prizepicks_api import POWER_PAYOUTS
-from ..utils.formatters import format_pct, format_game_time
+from ..utils.formatters import format_pct, format_game_time, format_american
 from . import theme as T
 from .widgets import Card, Pill, make_scroll
 from .state import AppState
@@ -35,6 +36,18 @@ from .state import AppState
 # Pick-tile layout constants
 TILE_MIN_W = 180
 TILE_H = 78
+
+# Platforms supported by the team-slip builder. The order is the order they
+# appear in the segmented selector. PrizePicks first because it's the most-
+# requested DFS book; Kalshi last because it's the prediction-market option
+# whose payout math is different from the DFS books.
+PLATFORMS: tuple[tuple[str, str, str], ...] = (
+    # (key passed to team_pick_to_leg, label shown on the button, accent color token)
+    ("prizepicks", "PrizePicks", T.ACCENT),
+    ("underdog",   "Underdog",   "#E8553C"),
+    ("kalshi",     "Kalshi",     "#0FB28C"),
+)
+_PLATFORM_LABEL = {k: lbl for k, lbl, _c in PLATFORMS}
 
 
 class TeamSlipView(ctk.CTkFrame):
@@ -49,8 +62,13 @@ class TeamSlipView(ctk.CTkFrame):
         super().__init__(master, fg_color=T.BG)
         self.state = state
         self.on_add_leg = on_add_leg
+        # Default to PrizePicks; users on the Underdog/Kalshi panels switch
+        # explicitly. The platform stamps the bookmaker on every leg this view
+        # creates, which is what the bet slip uses to pick the payout math.
+        self.platform = "prizepicks"
 
         self._build_header()
+        self._build_platform_selector()
         self._build_payout_strip()
 
         self.banner = ctk.CTkLabel(
@@ -79,13 +97,66 @@ class TeamSlipView(ctk.CTkFrame):
         ctk.CTkLabel(col, text="Team Slip Builder", font=T.FONT_TITLE, text_color=T.TEXT).pack(anchor="w")
         self.subtitle = ctk.CTkLabel(
             col,
-            text="PrizePicks-style team picks — tap a tile to add, 2–6 legs for a power play.",
+            text="",   # filled in by render() / _refresh_subtitle once platform is known
             font=T.FONT_SMALL, text_color=T.TEXT_MUTED,
         )
         self.subtitle.pack(anchor="w", pady=(2, 0))
 
         self.source_pill = Pill(head, "DEMO", color=T.BG_ELEV_3, text_color=T.TEXT_MUTED)
         self.source_pill.pack(side="right")
+
+    def _build_platform_selector(self):
+        """Segmented platform selector. Stamps each new leg with the chosen book."""
+        wrap = ctk.CTkFrame(self, fg_color="transparent")
+        wrap.pack(fill="x", padx=24, pady=(0, 6))
+
+        ctk.CTkLabel(
+            wrap, text="PLATFORM", font=T.FONT_TINY, text_color=T.TEXT_MUTED,
+        ).pack(side="left", padx=(0, 10))
+
+        self._platform_buttons: dict[str, ctk.CTkButton] = {}
+        for key, label, accent in PLATFORMS:
+            btn = ctk.CTkButton(
+                wrap, text=label, height=30, width=110, corner_radius=8,
+                fg_color=T.BG_ELEV_2, hover_color=T.BG_ELEV_3,
+                text_color=T.TEXT, font=T.FONT_BOLD,
+                command=lambda k=key: self._pick_platform(k),
+            )
+            btn.pack(side="left", padx=(0, 6))
+            # Stash the accent so the active-state styling can use it.
+            btn._accent_color = accent  # type: ignore[attr-defined]
+            self._platform_buttons[key] = btn
+        self._highlight_platform()
+
+    def _pick_platform(self, key: str):
+        if key not in _PLATFORM_LABEL:
+            return
+        self.platform = key
+        self._highlight_platform()
+        self._refresh_subtitle()
+        self._update_payout_strip()
+
+    def _highlight_platform(self):
+        for k, btn in self._platform_buttons.items():
+            if k == self.platform:
+                btn.configure(
+                    fg_color=getattr(btn, "_accent_color", T.ACCENT),
+                    text_color=T.BG,
+                )
+            else:
+                btn.configure(fg_color=T.BG_ELEV_2, text_color=T.TEXT)
+
+    def _refresh_subtitle(self):
+        sport_label = SPORT_LABELS.get(self.state.sport_key, self.state.sport_key)
+        n_games = len(self.state.games)
+        platform = _PLATFORM_LABEL.get(self.platform, self.platform)
+        if self.platform == "kalshi":
+            tail = "tap a tile to add — Kalshi parlay pays the no-vig product."
+        else:
+            tail = f"tap a tile to add, 2–6 legs for a {platform} power play."
+        self.subtitle.configure(
+            text=f"{n_games} games  ·  {sport_label}  ·  {tail}",
+        )
 
     def _build_payout_strip(self):
         """Always-visible strip showing payout ladder + current slip length."""
@@ -95,7 +166,12 @@ class TeamSlipView(ctk.CTkFrame):
         inner = ctk.CTkFrame(strip, fg_color="transparent")
         inner.pack(fill="x", padx=14, pady=10)
 
-        ctk.CTkLabel(inner, text="POWER PLAY", font=T.FONT_TINY, text_color=T.TEXT_MUTED).pack(side="left")
+        # Stored on self so the platform-aware update can swap text between
+        # "POWER PLAY" (PrizePicks/Underdog) and "KALSHI YES PARLAY" (Kalshi).
+        self._payout_label = ctk.CTkLabel(
+            inner, text="POWER PLAY", font=T.FONT_TINY, text_color=T.TEXT_MUTED,
+        )
+        self._payout_label.pack(side="left")
 
         # Ladder of all tiers — highlight whichever matches the current slip
         self._ladder: dict[int, ctk.CTkLabel] = {}
@@ -124,9 +200,20 @@ class TeamSlipView(ctk.CTkFrame):
             self._update_payout_strip()
 
     def _update_payout_strip(self):
-        """Highlight the current slip length's multiplier on the ladder."""
-        # Only count DFS team/prop legs — mixing standard parlay legs in the
-        # main slip doesn't unlock the power-play multiplier.
+        """Update the payout strip — DFS books use the multiplier ladder;
+        Kalshi falls back to fair-price parlay math because Kalshi has no
+        fixed multiplier (each yes contract trades at its market price).
+        """
+        if self.platform == "kalshi":
+            self._update_payout_strip_kalshi()
+            return
+
+        # DFS path: count team/prop legs that are PrizePicks/Underdog/demo.
+        # Underdog and PrizePicks share the same power-play ladder, so we
+        # bucket them together. Kalshi legs are intentionally excluded — if
+        # you mix Kalshi and DFS legs in the same slip, none of the slip is
+        # eligible for the multiplier and analyze_parlay correctly falls
+        # through to standard parlay math.
         dfs_legs = [
             l for l in self.state.bet_slip
             if (l.market.startswith("team_") or l.market.startswith("prop_"))
@@ -135,10 +222,13 @@ class TeamSlipView(ctk.CTkFrame):
         n = len(dfs_legs)
 
         for tier, pill in self._ladder.items():
+            pill.pack(side="left", padx=4)
             if tier == n:
                 pill.configure(fg_color=T.ACCENT, text_color=T.BG)
             else:
                 pill.configure(fg_color=T.BG_ELEV_2, text_color=T.TEXT_MUTED)
+
+        self._payout_label.configure(text="POWER PLAY")
 
         if n == 0:
             self.slip_status.configure(
@@ -161,6 +251,44 @@ class TeamSlipView(ctk.CTkFrame):
                 text_color=T.NEGATIVE,
             )
 
+    def _update_payout_strip_kalshi(self):
+        """Kalshi path: hide the multiplier ladder, show combined fair price."""
+        # Hide the DFS ladder pills — they don't apply to Kalshi.
+        for pill in self._ladder.values():
+            pill.pack_forget()
+
+        kalshi_legs = [
+            l for l in self.state.bet_slip
+            if l.market.startswith("team_") and l.bookmaker.lower() == "kalshi"
+        ]
+        n = len(kalshi_legs)
+        self._payout_label.configure(text="KALSHI YES PARLAY")
+
+        if n == 0:
+            self.slip_status.configure(
+                text="Pick 2+ legs for a Kalshi parlay.", text_color=T.TEXT_MUTED,
+            )
+            return
+
+        analysis = analyze_parlay(kalshi_legs)
+        # Combined fair-price multiplier = product of (1/fair) per leg = combined_decimal.
+        if n == 1:
+            self.slip_status.configure(
+                text=(
+                    f"1 leg · fair price {format_american(kalshi_legs[0].price)}. "
+                    "Add another for a parlay."
+                ),
+                text_color=T.WARNING,
+            )
+            return
+        self.slip_status.configure(
+            text=(
+                f"{n} legs · combined fair price {format_american(analysis.combined_american)} "
+                f"· hit {analysis.combined_prob * 100:.1f}%"
+            ),
+            text_color=T.ACCENT,
+        )
+
     # ---------------- Render ----------------
 
     def render(self):
@@ -168,10 +296,7 @@ class TeamSlipView(ctk.CTkFrame):
             child.destroy()
 
         games = self.state.games
-        self.subtitle.configure(
-            text=(f"{len(games)} games  ·  {SPORT_LABELS.get(self.state.sport_key, self.state.sport_key)}  "
-                  f"·  tap a tile to add, 2–6 legs for a power play.")
-        )
+        self._refresh_subtitle()
         self._render_source_banner()
         self._update_payout_strip()
 
@@ -180,10 +305,14 @@ class TeamSlipView(ctk.CTkFrame):
             return
         self.empty.place_forget()
 
+        # `platform_provider` is a closure rather than a snapshot so cards
+        # built before a platform switch still pick up the new value when a
+        # tile is tapped — re-rendering on every switch would be wasteful.
         for g in games:
-            GamePickEmCard(self.list, g, self.state, self.on_add_leg).pack(
-                fill="x", pady=8, padx=8,
-            )
+            GamePickEmCard(
+                self.list, g, self.state, self.on_add_leg,
+                platform_provider=lambda: self.platform,
+            ).pack(fill="x", pady=8, padx=8)
 
     def _render_source_banner(self):
         src = getattr(self.state, "games_source", "demo")
@@ -207,11 +336,15 @@ class GamePickEmCard(Card):
         game: Game,
         state: AppState,
         on_add_leg: Callable[[LegAnalysis], None],
+        platform_provider: Callable[[], str] | None = None,
     ):
         super().__init__(master)
         self.game = game
         self.state = state
         self.on_add_leg = on_add_leg
+        # Resolved at click time rather than card-build time so platform
+        # switches don't require re-rendering every card.
+        self.platform_provider = platform_provider or (lambda: "prizepicks")
 
         outer = ctk.CTkFrame(self, fg_color="transparent")
         outer.pack(fill="x", padx=18, pady=16)
@@ -270,6 +403,7 @@ class GamePickEmCard(Card):
                 display_name=display_name,
                 state=self.state,
                 on_add_leg=self.on_add_leg,
+                platform_provider=self.platform_provider,
             )
             tile.grid(row=0, column=col, sticky="ew", padx=4)
 
@@ -287,6 +421,7 @@ class PickTile(ctk.CTkFrame):
         display_name: str,
         state: AppState,
         on_add_leg: Callable[[LegAnalysis], None],
+        platform_provider: Callable[[], str] | None = None,
     ):
         super().__init__(master, fg_color=T.BG_ELEV_2, corner_radius=10, height=TILE_H)
         self.grid_propagate(False)
@@ -296,6 +431,7 @@ class PickTile(ctk.CTkFrame):
         self.selection = selection
         self.state = state
         self.on_add_leg = on_add_leg
+        self.platform_provider = platform_provider or (lambda: "prizepicks")
 
         # Derive the point + fair prob up front so the tile can render
         # informatively even before it's tapped.
@@ -348,7 +484,10 @@ class PickTile(ctk.CTkFrame):
             w.bind("<Button-1>", lambda _e: self._on_click())
 
     def _on_click(self):
-        leg = team_pick_to_leg(self.game, self.market_key, self.selection)
+        leg = team_pick_to_leg(
+            self.game, self.market_key, self.selection,
+            platform=self.platform_provider(),
+        )
         if leg is None:
             return
         self.on_add_leg(leg)
