@@ -9,13 +9,10 @@ the main loop.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
-from statistics import median
 from typing import Iterable
 
 from ..api.odds_api import Game, Bookmaker, Outcome
-from ..utils.formatters import (
-    american_to_implied, american_to_decimal, devig_two_way,
-)
+from ..utils.formatters import american_to_implied, american_to_decimal
 
 
 # --- Line shop (all books side-by-side for one selection) ---------------
@@ -95,18 +92,10 @@ def line_shop_for(game: Game, market_key: str, selection: str) -> LineShop:
 
 
 def _fair_prob(game: Game, market_key: str, selection: str) -> float:
-    """Median implied devigged against the opposite selection."""
-    opp = _opposite(game, market_key, selection)
-    sel_imps = [american_to_implied(p) for p in game.consensus_prices(market_key, selection)]
-    opp_imps = [american_to_implied(p) for p in game.consensus_prices(market_key, opp)] if opp else []
-    if not sel_imps:
-        return 0.0
-    med_sel = median(sel_imps)
-    if not opp_imps:
-        return med_sel
-    med_opp = median(opp_imps)
-    fair_sel, _ = devig_two_way(med_sel, med_opp)
-    return fair_sel
+    """Sharpness-weighted, per-book de-vigged consensus (see `model.consensus`)."""
+    from . import model as M
+    cons = M.consensus(game, market_key, selection)
+    return cons.fair_prob if cons else 0.0
 
 
 def _opposite(game: Game, market_key: str, selection: str) -> str | None:

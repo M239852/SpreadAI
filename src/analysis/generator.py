@@ -295,9 +295,9 @@ def _reason_for_leg(leg: LegAnalysis, research: GameResearch | None) -> str:
     # Adjustment drivers
     drivers: list[str] = []
     for f in leg.adjustments:
-        if abs(f.weight) < 0.04:
+        if abs(f.contribution) < 0.02:
             continue
-        arrow = "↑" if f.weight > 0 else "↓"
+        arrow = "↑" if f.contribution > 0 else "↓"
         drivers.append(f"{arrow} {f.name}: {f.description}")
     if drivers:
         parts.append("Research drivers — " + "; ".join(drivers) + ".")

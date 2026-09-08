@@ -1,12 +1,15 @@
+"""Application shell: sidebar navigation, top command bar, view stack, bet slip drawer."""
 from __future__ import annotations
 import threading
-from typing import Callable
+from datetime import datetime
 import customtkinter as ctk
 
 from ..api.odds_api import OddsAPI, SPORT_LABELS
 from ..api.demo_data import demo_games
+from ..analysis import model as M
 from ..utils.storage import load_config, save_config
 from . import theme as T
+from .widgets import Pill, Segmented, IconButton, PrimaryButton, GhostButton, Tooltip, install_treeview_styles
 from .state import AppState
 from .games_view import GamesView
 from .analysis_view import AnalysisView
@@ -21,151 +24,262 @@ from .prop_generator_view import PropGeneratorView
 
 
 # Auto-refresh cadence for live odds polling. The Odds API rate-limits the
-# free tier but 60s is well inside the quota for a single-sport pull and is
-# the lowest interval Realsports.io-class scanners typically use.
+# free tier but 60s is well inside the quota for a single-sport pull.
 AUTO_REFRESH_MS = 60_000
+
+# Navigation, grouped. (key, label, icon, shortcut digit)
+NAV_GROUPS: list[tuple[str, list[tuple[str, str, str]]]] = [
+    ("Trade", [
+        ("games",    "Board",         "▦"),
+        ("markets",  "Markets",       "▤"),
+        ("analyzer", "Odds Analyzer", "◈"),
+    ]),
+    ("Build", [
+        ("team_slip",      "Team Slip",      "◆"),
+        ("props",          "Player Props",   "◉"),
+        ("prop_generator", "Prop Generator", "✧"),
+        ("generator",      "Parlay Generator", "✦"),
+    ]),
+    ("Research", [
+        ("analysis", "Game Analysis", "◎"),
+    ]),
+]
 
 
 class App(ctk.CTk):
     def __init__(self):
         super().__init__(fg_color=T.BG)
         self.title(f"{T.APP_NAME} — {T.APP_TAGLINE}")
-        self.geometry("1440x900")
+        self.geometry("1480x920")
         self.minsize(1180, 720)
-
         ctk.set_appearance_mode("dark")
+        install_treeview_styles()
 
         self.state_ = AppState(config=load_config())
         self.state_.sport_key = self.state_.config.get("default_sport", "americanfootball_nfl")
+        M.configure(M.settings_from_config(self.state_.config))
 
         self._auto_refresh_job: str | None = None
+        self._sidebar_collapsed = False
+        self._slip_visible = True
+        self._current_view = "games"
+        self._last_refresh: datetime | None = None
 
         self._build_layout()
-        self._wire()
+        self._bind_shortcuts()
+        self.state_.subscribe(self._on_state_event)
 
-        # Initial load + kick off the auto-refresh timer
         self.after(200, self.refresh_games)
         self._schedule_auto_refresh()
 
-    # ---------------- Layout ----------------
+    # ================================================================ layout
 
     def _build_layout(self):
-        # Root grid: sidebar | main | bet slip
-        self.grid_columnconfigure(0, weight=0, minsize=210)
+        # Root grid: sidebar | (topbar over main) | slip
+        self.grid_columnconfigure(0, weight=0, minsize=T.SIDEBAR_W)
         self.grid_columnconfigure(1, weight=1)
-        self.grid_columnconfigure(2, weight=0, minsize=380)
-        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(2, weight=0)
+        self.grid_rowconfigure(0, weight=0)
+        self.grid_rowconfigure(1, weight=1)
 
-        self.sidebar = ctk.CTkFrame(self, fg_color=T.BG_ELEV_1, corner_radius=0)
-        self.sidebar.grid(row=0, column=0, sticky="nsw")
+        self.sidebar = ctk.CTkFrame(self, fg_color=T.BG_ELEV_1, corner_radius=0, width=T.SIDEBAR_W)
+        self.sidebar.grid(row=0, column=0, rowspan=2, sticky="nsw")
+        self.sidebar.grid_propagate(False)
+
+        self.topbar = ctk.CTkFrame(self, fg_color=T.BG, corner_radius=0, height=T.TOPBAR_H)
+        self.topbar.grid(row=0, column=1, columnspan=2, sticky="new")
+        self.topbar.grid_propagate(False)
 
         self.main = ctk.CTkFrame(self, fg_color=T.BG, corner_radius=0)
-        self.main.grid(row=0, column=1, sticky="nsew")
+        self.main.grid(row=1, column=1, sticky="nsew")
         self.main.grid_rowconfigure(0, weight=1)
         self.main.grid_columnconfigure(0, weight=1)
 
         self.slip = BetSlipPanel(self, self.state_)
-        self.slip.grid(row=0, column=2, sticky="nse")
+        self.slip.grid(row=1, column=2, sticky="nse")
 
         self._build_sidebar()
+        self._build_topbar()
         self._build_main_views()
 
-    def _build_sidebar(self):
-        # Brand
-        brand = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        brand.pack(fill="x", padx=22, pady=(22, 14))
-        ctk.CTkLabel(brand, text=T.APP_NAME, font=T.FONT_HUGE, text_color=T.TEXT).pack(anchor="w")
-        ctk.CTkLabel(brand, text=T.APP_TAGLINE, font=T.FONT_TINY, text_color=T.TEXT_MUTED).pack(anchor="w")
+    # ---------------------------------------------------------------- sidebar
 
-        # Navigation
-        nav = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        nav.pack(fill="x", padx=12, pady=(10, 4))
+    def _build_sidebar(self):
+        sb = self.sidebar
+
+        brand = ctk.CTkFrame(sb, fg_color="transparent")
+        brand.pack(fill="x", padx=T.SP_4, pady=(T.SP_5, T.SP_3))
+        self.brand_lbl = ctk.CTkLabel(brand, text=T.APP_NAME, font=T.FONT_HUGE, text_color=T.TEXT, anchor="w")
+        self.brand_lbl.pack(side="left")
+        self.collapse_btn = IconButton(brand, "‹", command=self.toggle_sidebar, width=28)
+        self.collapse_btn.pack(side="right")
+        Tooltip(self.collapse_btn, "Collapse sidebar")
+        self.brand_sub = ctk.CTkLabel(sb, text=f"{T.APP_TAGLINE}  ·  model v{M.MODEL_VERSION}",
+                                      font=T.FONT_TINY, text_color=T.TEXT_MUTED, anchor="w")
+        self.brand_sub.pack(fill="x", padx=T.SP_4)
 
         self.nav_buttons: dict[str, ctk.CTkButton] = {}
-        for key, label, icon in (
-            ("games", "Board", "◼"),
-            ("markets", "Markets", "▤"),
-            ("analyzer", "Odds Analyzer", "◈"),
-            ("team_slip", "Team Slip", "◆"),
-            ("props", "Player Props", "◉"),
-            ("prop_generator", "Prop Generator", "✧"),
-            ("generator", "Generator", "✦"),
-            ("analysis", "Analysis", "◎"),
-            ("settings", "Settings", "⚙"),
-        ):
-            b = ctk.CTkButton(
-                nav, text=f"  {icon}   {label}",
-                anchor="w", height=38,
-                fg_color="transparent", hover_color=T.BG_ELEV_2,
-                text_color=T.TEXT_MUTED, font=T.FONT_BOLD,
-                corner_radius=8,
-                command=lambda k=key: self.show(k),
-            )
-            b.pack(fill="x", pady=2)
-            self.nav_buttons[key] = b
+        self._nav_meta: dict[str, tuple[str, str]] = {}
+        self._group_labels: list[ctk.CTkLabel] = []
+        nav = ctk.CTkFrame(sb, fg_color="transparent")
+        nav.pack(fill="x", padx=T.SP_3, pady=(T.SP_4, 0))
+        shortcut = 1
+        for group, items in NAV_GROUPS:
+            lbl = ctk.CTkLabel(nav, text=group.upper(), font=T.FONT_LABEL, text_color=T.TEXT_DIM, anchor="w")
+            lbl.pack(fill="x", padx=T.SP_2, pady=(T.SP_3, 2))
+            self._group_labels.append(lbl)
+            for key, label, icon in items:
+                b = ctk.CTkButton(
+                    nav, text=f"  {icon}   {label}", anchor="w", height=36,
+                    fg_color="transparent", hover_color=T.BG_ELEV_2,
+                    text_color=T.TEXT_MUTED, font=T.FONT_BOLD, corner_radius=T.R_SM,
+                    command=lambda k=key: self.show(k),
+                )
+                b.pack(fill="x", pady=1)
+                Tooltip(b, f"{label}   (Ctrl+{shortcut})" if shortcut <= 9 else label)
+                self.nav_buttons[key] = b
+                self._nav_meta[key] = (label, icon)
+                shortcut += 1
 
-        # Divider
-        ctk.CTkFrame(self.sidebar, height=1, fg_color=T.BORDER).pack(fill="x", pady=(10, 8), padx=16)
+        # Footer: settings + bankroll summary
+        footer = ctk.CTkFrame(sb, fg_color="transparent")
+        footer.pack(side="bottom", fill="x", padx=T.SP_3, pady=T.SP_3)
+        self.bankroll_card = ctk.CTkFrame(footer, fg_color=T.BG_ELEV_2, corner_radius=T.R_MD)
+        self.bankroll_card.pack(fill="x", pady=(0, T.SP_2))
+        inner = ctk.CTkFrame(self.bankroll_card, fg_color="transparent")
+        inner.pack(fill="x", padx=T.SP_3, pady=T.SP_2)
+        ctk.CTkLabel(inner, text="BANKROLL", font=T.FONT_LABEL, text_color=T.TEXT_MUTED, anchor="w").pack(anchor="w")
+        self.bankroll_lbl = ctk.CTkLabel(inner, text="—", font=T.FONT_HEAD, text_color=T.TEXT, anchor="w")
+        self.bankroll_lbl.pack(anchor="w")
+        self.kelly_lbl = ctk.CTkLabel(inner, text="", font=T.FONT_TINY, text_color=T.TEXT_DIM, anchor="w")
+        self.kelly_lbl.pack(anchor="w")
+        self._refresh_bankroll_card()
 
-        # Sport picker
-        ctk.CTkLabel(self.sidebar, text="SPORT", font=T.FONT_TINY, text_color=T.TEXT_MUTED).pack(anchor="w", padx=22)
-        sports = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        sports.pack(fill="x", padx=12, pady=(4, 8))
-        self.sport_buttons: dict[str, ctk.CTkButton] = {}
-        for key, label in SPORT_LABELS.items():
-            b = ctk.CTkButton(
-                sports, text=f"  {label}",
-                anchor="w", height=32,
-                fg_color="transparent", hover_color=T.BG_ELEV_2,
-                text_color=T.TEXT_MUTED, font=T.FONT_SMALL,
-                corner_radius=6,
-                command=lambda k=key: self.set_sport(k),
-            )
-            b.pack(fill="x", pady=1)
-            self.sport_buttons[key] = b
-
-        # Refresh button fixed at bottom
-        bottom = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        bottom.pack(side="bottom", fill="x", padx=16, pady=16)
-
-        self.refresh_btn = ctk.CTkButton(
-            bottom, text="↻  Refresh odds", height=38,
-            fg_color=T.ACCENT, hover_color=T.ACCENT_HOVER, text_color=T.BG,
-            font=T.FONT_BOLD, corner_radius=8,
-            command=self.refresh_games,
+        b = ctk.CTkButton(
+            footer, text="  ⚙   Settings", anchor="w", height=36,
+            fg_color="transparent", hover_color=T.BG_ELEV_2,
+            text_color=T.TEXT_MUTED, font=T.FONT_BOLD, corner_radius=T.R_SM,
+            command=lambda: self.show("settings"),
         )
-        self.refresh_btn.pack(fill="x", pady=(0, 6))
+        b.pack(fill="x")
+        self.nav_buttons["settings"] = b
+        self._nav_meta["settings"] = ("Settings", "⚙")
 
-        self.status_lbl = ctk.CTkLabel(bottom, text="", font=T.FONT_TINY, text_color=T.TEXT_MUTED)
-        self.status_lbl.pack(anchor="w")
+    def toggle_sidebar(self):
+        self._sidebar_collapsed = not self._sidebar_collapsed
+        collapsed = self._sidebar_collapsed
+        width = T.SIDEBAR_W_COLLAPSED if collapsed else T.SIDEBAR_W
+        self.sidebar.configure(width=width)
+        self.grid_columnconfigure(0, minsize=width)
+        self.brand_lbl.configure(text="S" if collapsed else T.APP_NAME)
+        self.collapse_btn.configure(text="›" if collapsed else "‹")
+        if collapsed:
+            self.brand_sub.pack_forget()
+            self.bankroll_card.pack_forget()
+            for lbl in self._group_labels:
+                lbl.pack_forget()
+        else:
+            self.brand_sub.pack(fill="x", padx=T.SP_4, after=self.brand_lbl.master)
+            self.bankroll_card.pack(fill="x", pady=(0, T.SP_2), before=self.nav_buttons["settings"])
+            # Group labels need re-packing in order; simplest is to re-pack all nav children.
+            self._repack_nav()
+        for key, b in self.nav_buttons.items():
+            label, icon = self._nav_meta[key]
+            b.configure(text=(f" {icon}" if collapsed else f"  {icon}   {label}"),
+                        anchor=("center" if collapsed else "w"))
+
+    def _repack_nav(self):
+        nav = next(iter(self.nav_buttons.values())).master
+        for child in nav.winfo_children():
+            child.pack_forget()
+        for group, items in NAV_GROUPS:
+            lbl = next((l for l in self._group_labels if l.cget("text") == group.upper()), None)
+            if lbl is not None:
+                lbl.pack(fill="x", padx=T.SP_2, pady=(T.SP_3, 2))
+            for key, _label, _icon in items:
+                self.nav_buttons[key].pack(fill="x", pady=1)
+
+    def _refresh_bankroll_card(self):
+        cfg = self.state_.config
+        try:
+            bank = float(cfg.get("bankroll") or 0)
+        except (TypeError, ValueError):
+            bank = 0.0
+        try:
+            kf = float(cfg.get("kelly_fraction") or 0.25)
+        except (TypeError, ValueError):
+            kf = 0.25
+        self.bankroll_lbl.configure(text=f"${bank:,.0f}")
+        self.kelly_lbl.configure(text=f"{kf:g}× Kelly · {'conservative' if M.current_settings().kelly_conservative else 'point estimate'}")
+
+    # ---------------------------------------------------------------- topbar
+
+    def _build_topbar(self):
+        bar = ctk.CTkFrame(self.topbar, fg_color="transparent")
+        bar.pack(fill="both", expand=True, padx=T.PAGE_PAD_X, pady=(T.SP_3, T.SP_2))
+
+        self.sport_seg = Segmented(
+            bar, [(k, v) for k, v in SPORT_LABELS.items()],
+            value=self.state_.sport_key, command=self.set_sport, height=28, font=T.FONT_SMALL,
+        )
+        self.sport_seg.pack(side="left")
+
+        right = ctk.CTkFrame(bar, fg_color="transparent")
+        right.pack(side="right")
+
+        self.slip_btn = GhostButton(right, "Slip", command=self.toggle_slip, width=96, height=30)
+        self.slip_btn.pack(side="right", padx=(T.SP_2, 0))
+        Tooltip(self.slip_btn, "Show / hide the bet slip   (Ctrl+B)")
+
+        self.refresh_btn = PrimaryButton(right, "↻  Refresh", command=self.refresh_games, height=30, width=110)
+        self.refresh_btn.pack(side="right", padx=(T.SP_2, 0))
+        Tooltip(self.refresh_btn, "Pull fresh odds   (Ctrl+R)")
+
+        self.status_lbl = ctk.CTkLabel(right, text="", font=T.FONT_SMALL, text_color=T.TEXT_MUTED)
+        self.status_lbl.pack(side="right", padx=(T.SP_3, T.SP_2))
+        self.source_pill = Pill(right, "DEMO", variant="neutral")
+        self.source_pill.pack(side="right")
+
+        ctk.CTkFrame(self.topbar, height=1, fg_color=T.BORDER).pack(side="bottom", fill="x")
+
+    def _update_slip_button(self):
+        n = len(self.state_.bet_slip)
+        text = f"Slip · {n}" if n else "Slip"
+        self.slip_btn.configure(
+            text=text,
+            fg_color=(T.ACCENT_SOFT if self._slip_visible else T.BG_ELEV_3),
+            text_color=(T.ACCENT if self._slip_visible else T.TEXT),
+        )
+
+    def toggle_slip(self):
+        self._slip_visible = not self._slip_visible
+        if self._slip_visible:
+            self.slip.grid()
+        else:
+            self.slip.grid_remove()
+        self._update_slip_button()
+
+    # ---------------------------------------------------------------- views
 
     def _build_main_views(self):
         self.views: dict[str, ctk.CTkFrame] = {}
 
         self.games_view = GamesView(self.main, self.state_, self._add_leg, self._view_analysis)
         self.views["games"] = self.games_view
-
         self.markets_view = MarketsView(self.main, self.state_, self._add_leg)
         self.views["markets"] = self.markets_view
-
         self.analyzer_view = AnalyzerView(self.main, self.state_, self._add_leg)
         self.views["analyzer"] = self.analyzer_view
-
         self.team_slip_view = TeamSlipView(self.main, self.state_, self._add_leg)
         self.views["team_slip"] = self.team_slip_view
-
         self.props_view = PropsView(self.main, self.state_, self._add_leg)
         self.views["props"] = self.props_view
-
         self.prop_generator_view = PropGeneratorView(self.main, self.state_, self._add_leg)
         self.views["prop_generator"] = self.prop_generator_view
-
         self.generator_view = GeneratorView(self.main, self.state_, self._add_leg)
         self.views["generator"] = self.generator_view
-
         self.analysis_view = AnalysisView(self.main, self.state_, self._add_leg)
         self.views["analysis"] = self.analysis_view
-
         self.settings_view = SettingsView(self.main, self.state_, self._on_settings_saved)
         self.views["settings"] = self.settings_view
 
@@ -174,13 +288,12 @@ class App(ctk.CTk):
             v.grid_remove()
 
         self.show("games")
-
-    def _wire(self):
-        self._highlight_sport(self.state_.sport_key)
-
-    # ---------------- Navigation ----------------
+        self._update_slip_button()
 
     def show(self, key: str):
+        if key not in self.views:
+            return
+        self._current_view = key
         for k, v in self.views.items():
             if k == key:
                 v.grid()
@@ -188,9 +301,24 @@ class App(ctk.CTk):
                 v.grid_remove()
         for k, b in self.nav_buttons.items():
             if k == key:
-                b.configure(fg_color=T.BG_ELEV_2, text_color=T.ACCENT)
+                b.configure(fg_color=T.ACCENT_SOFT, text_color=T.ACCENT)
             else:
                 b.configure(fg_color="transparent", text_color=T.TEXT_MUTED)
+
+    def _bind_shortcuts(self):
+        self.bind("<Control-r>", lambda _e: self.refresh_games())
+        self.bind("<Control-b>", lambda _e: self.toggle_slip())
+        self.bind("<Control-bracketleft>", lambda _e: self.toggle_sidebar())
+        keys = [k for _g, items in NAV_GROUPS for k, _l, _i in items]
+        for i, key in enumerate(keys[:9], start=1):
+            self.bind(f"<Control-Key-{i}>", lambda _e, k=key: self.show(k))
+        self.bind("<Control-comma>", lambda _e: self.show("settings"))
+
+    # ---------------------------------------------------------------- state
+
+    def _on_state_event(self, event: str):
+        if event == "betslip":
+            self._update_slip_button()
 
     def set_sport(self, key: str):
         if key == self.state_.sport_key:
@@ -198,21 +326,15 @@ class App(ctk.CTk):
         self.state_.sport_key = key
         self.state_.config["default_sport"] = key
         save_config(self.state_.config)
-        self._highlight_sport(key)
+        self.sport_seg.set(key)
         self.state_.notify("sport")
         self.refresh_games()
 
-    def _highlight_sport(self, key: str):
-        for k, b in self.sport_buttons.items():
-            if k == key:
-                b.configure(fg_color=T.BG_ELEV_2, text_color=T.ACCENT)
-            else:
-                b.configure(fg_color="transparent", text_color=T.TEXT_MUTED)
-
-    # ---------------- Actions ----------------
+    # ---------------------------------------------------------------- actions
 
     def refresh_games(self):
         self.status_lbl.configure(text="Loading…", text_color=T.TEXT_MUTED)
+        self.refresh_btn.configure(state="disabled")
         sport = self.state_.sport_key
         cfg = self.state_.config
         api_key = cfg.get("odds_api_key", "")
@@ -251,19 +373,25 @@ class App(ctk.CTk):
     def _on_games_loaded(self, games, err: str, source: str = "demo"):
         self.state_.games = games
         self.state_.games_source = source
+        self._last_refresh = datetime.now()
         self.state_.notify("games")
+        self.refresh_btn.configure(state="normal")
+        label = SPORT_LABELS.get(self.state_.sport_key, self.state_.sport_key)
+        stamp = self._last_refresh.strftime("%H:%M")
         if err:
             self.status_lbl.configure(text=err, text_color=T.NEGATIVE)
         else:
-            label = SPORT_LABELS.get(self.state_.sport_key, self.state_.sport_key)
-            tag = "LIVE" if source == "live" else "DEMO"
             self.status_lbl.configure(
-                text=f"{tag} · {len(games)} {label} games.",
-                text_color=T.POSITIVE if source == "live" else T.TEXT_MUTED,
+                text=f"{len(games)} {label} games  ·  updated {stamp}",
+                text_color=T.TEXT_MUTED,
             )
+        self.source_pill.set("LIVE" if source == "live" else "DEMO",
+                             variant=("positive" if source == "live" else "neutral"))
 
     def _add_leg(self, leg):
         self.state_.add_leg(leg)
+        if not self._slip_visible:
+            self.toggle_slip()
 
     def _view_analysis(self, game_id: str):
         self.state_.selected_game_id = game_id
@@ -271,23 +399,19 @@ class App(ctk.CTk):
         self.analysis_view.show_game(game_id)
 
     def _on_settings_saved(self):
+        M.configure(M.settings_from_config(self.state_.config))
+        self._refresh_bankroll_card()
+        self.state_.notify("settings")
         self.status_lbl.configure(text="Settings saved.", text_color=T.POSITIVE)
         self.refresh_games()
 
-    # ---------------- Auto-refresh ----------------
+    # ---------------------------------------------------------------- auto-refresh
 
     def _schedule_auto_refresh(self):
-        """Periodic background pull so Markets / Analyzer stay current.
-
-        Only fires when an API key is configured — otherwise we'd just be
-        reshuffling demo data. `self.after` returns a job handle which we
-        hang onto so `_cancel_auto_refresh` can kill it on exit.
-        """
         self._auto_refresh_job = self.after(AUTO_REFRESH_MS, self._auto_refresh_tick)
 
     def _auto_refresh_tick(self):
-        cfg = self.state_.config
-        if cfg.get("odds_api_key"):
+        if self.state_.config.get("odds_api_key"):
             self.refresh_games()
         self._schedule_auto_refresh()
 

@@ -19,6 +19,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "bankroll": 1000.0,
     "kelly_fraction": 0.25,
     "use_demo_data_when_no_key": True,
+    # Probability-model switches (see src/analysis/model.py: ModelSettings).
+    "model": {
+        "use_cross_market": True,
+        "use_correlation": True,
+        "kelly_conservative": True,
+        "calibration_temperature": 1.0,
+        "calibration_shift": 0.0,
+        "evidence_discount": None,
+    },
 }
 
 
@@ -33,6 +42,9 @@ def load_config() -> dict[str, Any]:
         return dict(DEFAULT_CONFIG)
     merged = dict(DEFAULT_CONFIG)
     merged.update(data or {})
+    model = dict(DEFAULT_CONFIG["model"])
+    model.update((data or {}).get("model") or {})
+    merged["model"] = model
     return merged
 
 

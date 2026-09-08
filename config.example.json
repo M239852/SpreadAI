@@ -13,5 +13,13 @@
   ],
   "bankroll": 1000.0,
   "kelly_fraction": 0.25,
-  "use_demo_data_when_no_key": true
+  "use_demo_data_when_no_key": true,
+  "model": {
+    "use_cross_market": true,
+    "use_correlation": true,
+    "kelly_conservative": true,
+    "calibration_temperature": 1.0,
+    "calibration_shift": 0.0,
+    "evidence_discount": null
+  }
 }
