@@ -20,6 +20,7 @@ from ..utils.formatters import format_american, format_pct, format_money
 from . import theme as T
 from .widgets import PageHeader, Toolbar, Segmented, GhostButton, entry, slider, make_tree
 from .state import AppState
+from .runtime import LazyRenderMixin
 
 
 DEFAULT_MIN_EDGE = 0.02
@@ -27,7 +28,7 @@ DEFAULT_MIN_ARB_PROFIT = 0.005
 MAX_ROWS = 400
 
 
-class AnalyzerView(ctk.CTkFrame):
+class AnalyzerView(LazyRenderMixin, ctk.CTkFrame):
     """Tabbed cross-book scanner."""
 
     def __init__(self, master, state: AppState, on_add_leg: Callable[[LegAnalysis], None]):
@@ -164,7 +165,10 @@ class AnalyzerView(ctk.CTkFrame):
 
     def _on_state_event(self, event: str):
         if event in ("games", "sport"):
-            self._rerender_all()
+            self.request_render()
+
+    def render(self):
+        self._rerender_all()
 
     def _on_edge_change(self, value):
         self._min_edge = float(value)

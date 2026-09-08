@@ -16,6 +16,7 @@ from ..utils.formatters import format_pct, format_game_time, format_american
 from . import theme as T
 from .widgets import Card, Pill, PageHeader, Toolbar, Segmented, EmptyState, ProbBar, Tooltip, make_scroll
 from .state import AppState
+from .runtime import LazyRenderMixin, render_chunked
 
 
 PLATFORMS: tuple[tuple[str, str, str], ...] = (
@@ -27,7 +28,7 @@ _PLATFORM_LABEL = {k: lbl for k, lbl, _c in PLATFORMS}
 _PLATFORM_ACCENT = {k: c for k, _l, c in PLATFORMS}
 
 
-class TeamSlipView(ctk.CTkFrame):
+class TeamSlipView(LazyRenderMixin, ctk.CTkFrame):
     def __init__(self, master, state: AppState, on_add_leg: Callable[[LegAnalysis], None]):
         super().__init__(master, fg_color=T.BG)
         self.state = state
@@ -81,7 +82,7 @@ class TeamSlipView(ctk.CTkFrame):
 
     def _on_state_event(self, event: str):
         if event in ("games", "sport"):
-            self.render()
+            self.request_render()
         if event in ("betslip", "games", "sport"):
             self._update_strip()
 
@@ -137,9 +138,10 @@ class TeamSlipView(ctk.CTkFrame):
         if not games:
             EmptyState(self.list, "No games loaded", "Hit Refresh in the top bar to pull the slate.").pack(pady=T.SP_6 * 2)
             return
-        for g in games:
-            GamePickEmCard(self.list, g, self.state, self.on_add_leg, platform_provider=lambda: self.platform).pack(
-                fill="x", pady=(0, T.SP_3), padx=2)
+        render_chunked(self.list, list(games),
+                       lambda g: GamePickEmCard(self.list, g, self.state, self.on_add_leg,
+                                                platform_provider=lambda: self.platform).pack(fill="x", pady=(0, T.SP_3), padx=2),
+                       chunk=3)
 
 
 class GamePickEmCard(Card):

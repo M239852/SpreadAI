@@ -9,12 +9,13 @@ from ..utils.formatters import format_american, format_pct, format_game_time
 from . import theme as T
 from .widgets import Card, Pill, PageHeader, Toolbar, Segmented, EmptyState, GhostButton, entry, switch, make_scroll, Tooltip
 from .state import AppState
+from .runtime import LazyRenderMixin, render_chunked
 
 
 MARKET_LABELS = {"h2h": "Moneyline", "spreads": "Spread", "totals": "Total"}
 
 
-class GamesView(ctk.CTkFrame):
+class GamesView(LazyRenderMixin, ctk.CTkFrame):
     """Scrollable list of game cards with inline odds and quick add-to-slip buttons."""
 
     def __init__(
@@ -60,7 +61,7 @@ class GamesView(ctk.CTkFrame):
 
     def _on_state_event(self, event: str):
         if event in ("games", "sport", "settings"):
-            self.render()
+            self.request_render()
 
     def _on_query(self):
         self._query = (self.query_var.get() or "").strip().lower()
@@ -116,9 +117,13 @@ class GamesView(ctk.CTkFrame):
             self.empty.pack(pady=T.SP_6 * 2)
             return
 
-        for g, legs in summaries:
-            card = GameCard(self.list, g, legs, self.state, self.on_add_leg, self.on_view_analysis, ev_only=self._ev_only)
-            card.pack(fill="x", pady=(0, T.SP_3), padx=2)
+        # Cards are built a few per event-loop tick so a 60-game slate never
+        # freezes the window; a new render() cancels an in-flight one.
+        def build(item):
+            g, legs = item
+            GameCard(self.list, g, legs, self.state, self.on_add_leg, self.on_view_analysis,
+                     ev_only=self._ev_only).pack(fill="x", pady=(0, T.SP_3), padx=2)
+        render_chunked(self.list, summaries, build, chunk=3)
 
 
 def _selections(game: Game) -> list[tuple[str, str]]:

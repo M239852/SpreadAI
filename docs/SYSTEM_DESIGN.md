@@ -32,7 +32,8 @@ probability engine, and where to extend it.
    no widgets, no threads, no network calls except the explicit research
    fetchers. It is unit-tested in isolation (`tests/`).
 4. **The UI thread owns the widgets.** Network work runs on daemon threads and
-   results are marshalled back with `widget.after(0, …)`.
+   results are marshalled back through one queue (`runtime.ui_call`) that the
+   Tk main loop drains; workers never touch Tk.
 5. **Degrade gracefully.** Missing key → demo odds. Feed down → demo props.
    Research fetch fails → empty research, the market prior still prices the
    leg.
@@ -153,15 +154,17 @@ sequenceDiagram
     else no key
         W->>W: demo_games(sport)
     end
-    W->>App: after(0, _on_games_loaded)
+    W->>App: ui_call(_on_games_loaded) — queued, drained on the Tk thread
+    App->>App: fingerprint prices; skip notify if unchanged (auto tick)
     App->>S: games, games_source
     S->>V: notify("games")
-    V->>V: render() — Board, Markets, Analyzer, Team Slip re-price every selection
+    V->>V: visible view renders now (chunked); hidden views mark dirty
 ```
 
 The auto-refresh tick fires every 60 s but only calls the API when a key is
 configured, and `get_odds` serves the 120 s cache first, so a live session
-hits The Odds API at most every two minutes per sport.
+hits The Odds API at most every two minutes per sport. A tick whose prices
+match the previous pull updates the status line and re-renders nothing.
 
 ### 3.2 Pricing a leg (Board, Markets, Analyzer, Team Slip)
 
@@ -211,9 +214,12 @@ product; otherwise standard parlay odds.
 
 | Rule | Where |
 | --- | --- |
-| Tk main loop is the only thread that touches widgets. | all views |
-| Every network fetch runs in `threading.Thread(daemon=True)`. | `App.refresh_games`, `AnalysisView.show_game`, `PropsView._load/_analyze_all`, both generators |
-| Results return via `widget.after(0, callback)`. | same |
+| Tk main loop is the only thread that touches widgets — workers never call Tk, not even `after`. | all views |
+| Every network fetch runs on a daemon thread (`runtime.run_in_thread` or `threading.Thread`). | `App.refresh_games`, `AnalysisView.show_game`, `PropsView._load/_analyze_all`, both generators |
+| Results return via `runtime.ui_call(fn, …)`: one queue drained every 30 ms by the main loop (`start_pump`). Failures are logged to `.cache/spreadai.log`. | same |
+| A refresh in flight blocks a second one; a result for a sport the user has since left is dropped. | `App.refresh_games` (`_refreshing`), `_on_games_loaded` |
+| Hidden views don't re-render on `games`/`sport`; they mark themselves dirty and render when shown. | `runtime.LazyRenderMixin` — Board, Markets, Analyzer, Team Slip |
+| Long card lists are built a few per event-loop tick; a new render cancels an in-flight one. | `runtime.render_chunked` — Board, Markets, Team Slip |
 | Stale-result guard: the callback checks the view is still showing the same target before rendering. | `AnalysisView._on_research_ready` (`_current_game_id`) |
 | Long analyses report progress through a callback that itself hops to the UI thread. | generators (`progress_cb`) |
 | Background prop analysis repopulates the table every 25 rows and caps work at `ANALYZE_LIMIT = 200` visible props. | `PropsView._analyze_all` |
@@ -382,8 +388,10 @@ can show how much correlation moved the number.
   dot, book tick), `FactorBar` (signed contribution), `Sparkline` (samples vs
   line). Large lists use `make_tree` (themed, virtualized `ttk.Treeview`).
 * **Rendering strategy.** Views destroy and rebuild their card lists on each
-  `games`/`sport` event; the Board pre-computes all six legs per game once and
-  reuses them for sorting, filtering and cards.
+  `games`/`sport` event, but only while visible (hidden views catch up when
+  shown) and only when the pull actually changed prices. Cards are built in
+  chunks per event-loop tick. The Board pre-computes all six legs per game
+  once and reuses them for sorting, filtering and cards.
 
 ---
 

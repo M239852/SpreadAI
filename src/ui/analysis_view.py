@@ -14,6 +14,7 @@ from . import theme as T
 from .widgets import (Card, Pill, StatBlock, ProbBar, FactorBar, PrimaryButton, GhostButton,
                       EmptyState, Tooltip, make_scroll, section_label)
 from .state import AppState
+from .runtime import ui_call
 
 
 class AnalysisView(ctk.CTkFrame):
@@ -54,7 +55,7 @@ class AnalysisView(ctk.CTkFrame):
                 r = research_game(game)
             except Exception:
                 r = empty_research(game)
-            self.after(0, lambda: self._on_research_ready(game, r, loading))
+            ui_call(self._on_research_ready, game, r, loading)
 
         threading.Thread(target=work, daemon=True).start()
 

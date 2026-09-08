@@ -19,9 +19,10 @@ from ..utils.formatters import format_american, format_pct, format_game_time
 from . import theme as T
 from .widgets import Card, Pill, PageHeader, EmptyState, GhostButton, make_scroll, install_treeview_styles
 from .state import AppState
+from .runtime import LazyRenderMixin, render_chunked
 
 
-class MarketsView(ctk.CTkFrame):
+class MarketsView(LazyRenderMixin, ctk.CTkFrame):
     """Scrollable list of games, each with three market line-shop tables."""
 
     def __init__(self, master, state: AppState, on_add_leg: Callable[[LegAnalysis], None]):
@@ -40,7 +41,7 @@ class MarketsView(ctk.CTkFrame):
 
     def _on_state_event(self, event: str):
         if event in ("games", "sport"):
-            self.render()
+            self.request_render()
 
     def render(self):
         for child in self.list.winfo_children():
@@ -59,8 +60,9 @@ class MarketsView(ctk.CTkFrame):
         if not games:
             EmptyState(self.list, "No games loaded", "Hit Refresh in the top bar to pull the slate.").pack(pady=T.SP_6 * 2)
             return
-        for g in games:
-            GameMarketsCard(self.list, g, self.state, self.on_add_leg).pack(fill="x", pady=(0, T.SP_3), padx=2)
+        render_chunked(self.list, list(games),
+                       lambda g: GameMarketsCard(self.list, g, self.state, self.on_add_leg).pack(fill="x", pady=(0, T.SP_3), padx=2),
+                       chunk=2)
 
 
 class GameMarketsCard(Card):

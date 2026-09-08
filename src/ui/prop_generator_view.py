@@ -14,6 +14,7 @@ from . import theme as T
 from .widgets import (Card, Pill, StatBlock, PageHeader, Segmented, PrimaryButton, ProbBar, Sparkline, EmptyState,
                       Tooltip, entry, option_menu, switch, checkbox, make_scroll, section_label)
 from .state import AppState
+from .runtime import ui_call
 
 _BOOK_COLORS = {"prizepicks": T.ACCENT, "underdog": "#E8553C", "demo": T.TEXT_MUTED}
 SLIP_COUNT_CHOICES = (1, 2, 3, 4, 5)
@@ -173,7 +174,7 @@ class PropGeneratorView(ctk.CTkFrame):
         cache_key = (sport_key, tuple(book_list) if book_list else ("all",))
 
         def progress_cb(done: int, total: int, note: str):
-            self.after(0, lambda: self.progress_lbl.configure(text=f"{done}/{total} — {note}", text_color=T.TEXT_MUTED))
+            ui_call(self.progress_lbl.configure, text=f"{done}/{total} — {note}", text_color=T.TEXT_MUTED)
 
         def work():
             err = ""
@@ -182,7 +183,7 @@ class PropGeneratorView(ctk.CTkFrame):
                 if self._props_cache and self._props_cache_key == cache_key:
                     props = self._props_cache
                 else:
-                    self.after(0, lambda: self.progress_lbl.configure(text=f"Fetching {book_choice}…", text_color=T.TEXT_MUTED))
+                    ui_call(self.progress_lbl.configure, text=f"Fetching {book_choice}…", text_color=T.TEXT_MUTED)
                     try:
                         props = fetch_props_from_books(sport_key, book_list)
                     except Exception:
@@ -196,7 +197,7 @@ class PropGeneratorView(ctk.CTkFrame):
                                             book_filter=book_filter_for_generator)
             except Exception as e:
                 err = f"Generation failed: {e}"
-            self.after(0, lambda: self._on_generated(slips, err, loading))
+            ui_call(self._on_generated, slips, err, loading)
 
         threading.Thread(target=work, daemon=True).start()
 
