@@ -1,5 +1,7 @@
+"""Game research (ESPN) → adjustment factors for the probability model."""
 from __future__ import annotations
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from ..api import espn_api
@@ -9,6 +11,7 @@ from .probability import (
     injury_factor,
     form_factor,
     home_field_factor,
+    rest_factor,
 )
 
 
@@ -16,10 +19,12 @@ from .probability import (
 class TeamResearch:
     name: str
     record: str = ""
+    win_pct: float | None = None
     last5_summary: str = ""
     last5: list[dict[str, Any]] = field(default_factory=list)
     injuries: list[dict[str, Any]] = field(default_factory=list)
     injury_impact: float = 0.0
+    days_rest: float | None = None
     notes: list[str] = field(default_factory=list)
 
 
@@ -36,16 +41,68 @@ class GameResearch:
     h2h_summary: dict[str, Any] = field(default_factory=dict)
 
 
+def _parse_iso(s: str) -> datetime | None:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _days_rest(last5: list[dict[str, Any]], commence_time: str) -> float | None:
+    """Days between the team's most recent completed game and this game."""
+    if not last5:
+        return None
+    last = _parse_iso(last5[0].get("date", ""))
+    start = _parse_iso(commence_time) or datetime.now(timezone.utc)
+    if last is None:
+        return None
+    delta = (start - last).total_seconds() / 86400.0
+    if delta < 0 or delta > 30:
+        return None
+    return round(delta)
+
+
+def _team_research(game: Game, name: str) -> TeamResearch:
+    rec = espn_api.fetch_team_record_and_form(game.sport_key, name) or {}
+    inj = espn_api.fetch_team_injuries(game.sport_key, name) or []
+    win_pct = rec.get("win_pct")
+    try:
+        win_pct = float(win_pct) if win_pct is not None else None
+        if win_pct is not None and win_pct > 1.0:
+            win_pct /= 100.0
+    except (TypeError, ValueError):
+        win_pct = None
+    last5 = rec.get("last5", []) or []
+    return TeamResearch(
+        name=name,
+        record=rec.get("record", ""),
+        win_pct=win_pct,
+        last5_summary=rec.get("last5_summary", ""),
+        last5=last5,
+        injuries=inj,
+        injury_impact=espn_api.injury_impact_score(inj),
+        days_rest=_days_rest(last5, game.commence_time),
+    )
+
+
+def empty_research(game: Game) -> GameResearch:
+    return GameResearch(
+        game_id=game.id, sport_key=game.sport_key,
+        matchup=f"{game.away_team} @ {game.home_team}",
+        home=TeamResearch(name=game.home_team),
+        away=TeamResearch(name=game.away_team),
+    )
+
+
 def research_game(game: Game) -> GameResearch:
-    home_rec = espn_api.fetch_team_record_and_form(game.sport_key, game.home_team) or {}
-    away_rec = espn_api.fetch_team_record_and_form(game.sport_key, game.away_team) or {}
-    home_inj = espn_api.fetch_team_injuries(game.sport_key, game.home_team) or []
-    away_inj = espn_api.fetch_team_injuries(game.sport_key, game.away_team) or []
+    home = _team_research(game, game.home_team)
+    away = _team_research(game, game.away_team)
     news = espn_api.fetch_news(game.sport_key, limit=12)
     h2h = espn_api.fetch_head_to_head(game.sport_key, game.home_team, game.away_team, limit=6)
     h2h_summary = espn_api.head_to_head_summary(h2h)
 
-    # filter news mentioning either team
     def _team_relevant(article: dict[str, Any]) -> bool:
         text = (article.get("headline", "") + " " + article.get("description", "")).lower()
         for token in (game.home_team, game.away_team):
@@ -56,22 +113,6 @@ def research_game(game: Game) -> GameResearch:
 
     relevant_news = [a for a in news if _team_relevant(a)] or news[:6]
 
-    home = TeamResearch(
-        name=game.home_team,
-        record=home_rec.get("record", ""),
-        last5_summary=home_rec.get("last5_summary", ""),
-        last5=home_rec.get("last5", []),
-        injuries=home_inj,
-        injury_impact=espn_api.injury_impact_score(home_inj),
-    )
-    away = TeamResearch(
-        name=game.away_team,
-        record=away_rec.get("record", ""),
-        last5_summary=away_rec.get("last5_summary", ""),
-        last5=away_rec.get("last5", []),
-        injuries=away_inj,
-        injury_impact=espn_api.injury_impact_score(away_inj),
-    )
     return GameResearch(
         game_id=game.id,
         sport_key=game.sport_key,
@@ -85,7 +126,7 @@ def research_game(game: Game) -> GameResearch:
 
 
 def h2h_factor(research: GameResearch, favors_home: bool) -> AdjustmentFactor | None:
-    """Head-to-head bias becomes a mild adjustment factor.
+    """Head-to-head history is a weak, heavily-shrunk signal.
 
     `research.h2h_summary['bias']` is from the HOME team's perspective.
     """
@@ -93,18 +134,19 @@ def h2h_factor(research: GameResearch, favors_home: bool) -> AdjustmentFactor | 
     played = int(summary.get("played") or 0)
     if played < 2:
         return None
-    bias = float(summary.get("bias") or 0.0)  # home-team perspective
+    bias = float(summary.get("bias") or 0.0)
     sign = 1.0 if favors_home else -1.0
-    weight = sign * bias * 0.7  # dampened
     label = (
-        f"H2H last {played}: "
-        f"{summary.get('record', '')} "
+        f"H2H last {played}: {summary.get('record', '')} "
         f"({research.home.name} vs {research.away.name})"
     )
     return AdjustmentFactor(
         name="Head-to-head",
-        weight=weight,
+        weight=sign * bias,
         description=label,
+        scale=0.15,
+        confidence=0.5 * min(1.0, played / 8.0),
+        category="history",
     )
 
 
@@ -126,62 +168,62 @@ def build_factors_for_selection(
         else:
             favors_home = None
     else:
-        # Totals: no team bias; skip directional factors.
         favors_home = None
 
-    # Home field (directional)
-    if favors_home is True:
-        factors.append(home_field_factor(True, game.sport_key))
-    elif favors_home is False:
-        factors.append(home_field_factor(False, game.sport_key))
+    if favors_home is None and market_key != "totals":
+        return factors
 
-    # Injuries
-    if favors_home is True:
-        if research.home.injury_impact > 0.02:
-            factors.append(injury_factor(research.home.injury_impact, research.home.name, favors_outcome=False))
-        if research.away.injury_impact > 0.02:
-            factors.append(injury_factor(research.away.injury_impact, research.away.name, favors_outcome=True))
-    elif favors_home is False:
-        if research.away.injury_impact > 0.02:
-            factors.append(injury_factor(research.away.injury_impact, research.away.name, favors_outcome=False))
-        if research.home.injury_impact > 0.02:
-            factors.append(injury_factor(research.home.injury_impact, research.home.name, favors_outcome=True))
-    else:
-        # Totals: heavy injuries on either side slightly favor the under
-        total_impact = (research.home.injury_impact + research.away.injury_impact) / 2.0
-        if total_impact > 0.05:
-            favors = not selection.lower().startswith("over")
-            sign = 1.0 if favors else -1.0
-            factors.append(AdjustmentFactor(
-                name="Injury load (total)",
-                weight=sign * total_impact * 0.6,
-                description=f"Average injury impact across teams: {total_impact:.2f}",
-            ))
+    if favors_home is not None:
+        mine = research.home if favors_home else research.away
+        foe = research.away if favors_home else research.home
 
-    # Head-to-head (directional)
-    if favors_home is True:
-        f = h2h_factor(research, favors_home=True)
+        # Context only — priced into the line, zero scale.
+        factors.append(home_field_factor(favors_home, game.sport_key))
+
+        # Injuries
+        if mine.injury_impact > 0.02:
+            factors.append(injury_factor(mine.injury_impact, mine.name, favors_outcome=False))
+        if foe.injury_impact > 0.02:
+            factors.append(injury_factor(foe.injury_impact, foe.name, favors_outcome=True))
+
+        # Rest / schedule
+        f = rest_factor(mine.days_rest, mine.name, favors_outcome=True, sport_key=game.sport_key)
         if f:
             factors.append(f)
-    elif favors_home is False:
-        f = h2h_factor(research, favors_home=False)
+        f = rest_factor(foe.days_rest, foe.name, favors_outcome=False, sport_key=game.sport_key)
         if f:
             factors.append(f)
 
-    # Recent form (directional)
-    if favors_home is True:
-        f = form_factor({"last5": research.home.last5}, research.home.name, favors_outcome=True)
-        if f:
-            factors.append(f)
-        f = form_factor({"last5": research.away.last5}, research.away.name, favors_outcome=False)
-        if f:
-            factors.append(f)
-    elif favors_home is False:
-        f = form_factor({"last5": research.away.last5}, research.away.name, favors_outcome=True)
-        if f:
-            factors.append(f)
-        f = form_factor({"last5": research.home.last5}, research.home.name, favors_outcome=False)
+        # Head-to-head
+        f = h2h_factor(research, favors_home=favors_home)
         if f:
             factors.append(f)
 
+        # Recent form relative to baseline
+        f = form_factor({"last5": mine.last5, "win_pct": mine.win_pct}, mine.name, favors_outcome=True)
+        if f:
+            factors.append(f)
+        f = form_factor({"last5": foe.last5, "win_pct": foe.win_pct}, foe.name, favors_outcome=False)
+        if f:
+            factors.append(f)
+        return factors
+
+    # Totals: heavy injuries on either side lean under; back-to-backs lean under too.
+    total_impact = (research.home.injury_impact + research.away.injury_impact) / 2.0
+    is_over = selection.lower().startswith("over")
+    if total_impact > 0.05:
+        factors.append(AdjustmentFactor(
+            name="Injury load (total)",
+            weight=(-1.0 if is_over else 1.0) * total_impact,
+            description=f"Average injury impact across teams: {total_impact:.2f}",
+            scale=0.30,
+            confidence=0.6,
+            category="injuries",
+        ))
+    tired = [t for t in (research.home, research.away) if t.days_rest is not None and t.days_rest <= 1.0]
+    if tired:
+        f = rest_factor(1.0, " & ".join(t.name for t in tired), favors_outcome=not is_over, sport_key=game.sport_key)
+        if f:
+            f.name = "Rest (total)"
+            factors.append(f)
     return factors
