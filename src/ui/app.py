@@ -1,7 +1,9 @@
 """Application shell: sidebar navigation, top command bar, view stack, bet slip drawer."""
 from __future__ import annotations
 import logging
+import time
 from datetime import datetime
+from typing import Callable
 import customtkinter as ctk
 
 from ..api.odds_api import OddsAPI, SPORT_LABELS
@@ -275,36 +277,85 @@ class App(ctk.CTk):
     # ---------------------------------------------------------------- views
 
     def _build_main_views(self):
+        """Register view factories; each screen is constructed on first use.
+
+        Building all nine views up front cost roughly two seconds of widget
+        creation before the window could paint. Only the Board is needed at
+        startup, so the rest are constructed the first time they are shown and
+        cached from then on.
+        """
+        self._view_factories: dict[str, Callable[[], ctk.CTkFrame]] = {
+            "games":          lambda: GamesView(self.main, self.state_, self._add_leg, self._view_analysis),
+            "markets":        lambda: MarketsView(self.main, self.state_, self._add_leg),
+            "analyzer":       lambda: AnalyzerView(self.main, self.state_, self._add_leg),
+            "team_slip":      lambda: TeamSlipView(self.main, self.state_, self._add_leg),
+            "props":          lambda: PropsView(self.main, self.state_, self._add_leg),
+            "prop_generator": lambda: PropGeneratorView(self.main, self.state_, self._add_leg),
+            "generator":      lambda: GeneratorView(self.main, self.state_, self._add_leg),
+            "analysis":       lambda: AnalysisView(self.main, self.state_, self._add_leg),
+            "settings":       lambda: SettingsView(self.main, self.state_, self._on_settings_saved),
+        }
         self.views: dict[str, ctk.CTkFrame] = {}
-
-        self.games_view = GamesView(self.main, self.state_, self._add_leg, self._view_analysis)
-        self.views["games"] = self.games_view
-        self.markets_view = MarketsView(self.main, self.state_, self._add_leg)
-        self.views["markets"] = self.markets_view
-        self.analyzer_view = AnalyzerView(self.main, self.state_, self._add_leg)
-        self.views["analyzer"] = self.analyzer_view
-        self.team_slip_view = TeamSlipView(self.main, self.state_, self._add_leg)
-        self.views["team_slip"] = self.team_slip_view
-        self.props_view = PropsView(self.main, self.state_, self._add_leg)
-        self.views["props"] = self.props_view
-        self.prop_generator_view = PropGeneratorView(self.main, self.state_, self._add_leg)
-        self.views["prop_generator"] = self.prop_generator_view
-        self.generator_view = GeneratorView(self.main, self.state_, self._add_leg)
-        self.views["generator"] = self.generator_view
-        self.analysis_view = AnalysisView(self.main, self.state_, self._add_leg)
-        self.views["analysis"] = self.analysis_view
-        self.settings_view = SettingsView(self.main, self.state_, self._on_settings_saved)
-        self.views["settings"] = self.settings_view
-
-        for v in self.views.values():
-            v.grid(row=0, column=0, sticky="nsew")
-            v.grid_remove()
-
         self.show("games")
         self._update_slip_button()
 
+    def view(self, key: str):
+        """Return a view, constructing it the first time it is asked for."""
+        v = self.views.get(key)
+        if v is None:
+            factory = self._view_factories.get(key)
+            if factory is None:
+                return None
+            t0 = time.perf_counter()
+            v = factory()
+            v.grid(row=0, column=0, sticky="nsew")
+            v.grid_remove()
+            self.views[key] = v
+            log.debug("built view %r in %.0f ms", key, (time.perf_counter() - t0) * 1000)
+        return v
+
+    # Views the rest of the app reaches for by name; each builds on demand.
+    @property
+    def games_view(self):
+        return self.view("games")
+
+    @property
+    def analysis_view(self):
+        return self.view("analysis")
+
+    @property
+    def props_view(self):
+        return self.view("props")
+
+    @property
+    def generator_view(self):
+        return self.view("generator")
+
+    @property
+    def prop_generator_view(self):
+        return self.view("prop_generator")
+
+    @property
+    def team_slip_view(self):
+        return self.view("team_slip")
+
+    @property
+    def markets_view(self):
+        return self.view("markets")
+
+    @property
+    def analyzer_view(self):
+        return self.view("analyzer")
+
+    @property
+    def settings_view(self):
+        return self.view("settings")
+
     def show(self, key: str):
-        if key not in self.views:
+        if key not in self._view_factories:
+            return
+        target = self.view(key)
+        if target is None:
             return
         previous = self.views.get(self._current_view)
         self._current_view = key
@@ -314,10 +365,10 @@ class App(ctk.CTk):
             else:
                 v.grid_remove()
         # Hidden views skip re-rendering; the one being shown catches up.
-        if previous is not None and previous is not self.views[key] and hasattr(previous, "on_hidden"):
+        if previous is not None and previous is not target and hasattr(previous, "on_hidden"):
             previous.on_hidden()
-        if hasattr(self.views[key], "on_shown"):
-            self.views[key].on_shown()
+        if hasattr(target, "on_shown"):
+            target.on_shown()
         for k, b in self.nav_buttons.items():
             if k == key:
                 b.configure(fg_color=T.ACCENT_SOFT, text_color=T.ACCENT)

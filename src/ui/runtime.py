@@ -85,7 +85,7 @@ class LazyRenderMixin:
     """
 
     _lazy_shown: bool = False
-    _lazy_dirty: bool = False
+    _lazy_dirty: bool = True    # a lazily-built view has never rendered yet
 
     def request_render(self) -> None:
         if self._lazy_shown:

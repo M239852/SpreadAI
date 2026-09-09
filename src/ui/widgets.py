@@ -451,35 +451,44 @@ class ProbBar(tk.Canvas):
                 self.create_text(x(p), h - 2, text=f"{int(p*100)}", fill=T.TEXT_DIM, font=T.FONT_TINY, anchor="s")
 
 
-class FactorBar(ctk.CTkFrame):
-    """One research factor: name, a centered signed bar, and its value."""
+class FactorBar(tk.Frame):
+    """One research factor: name, a centered signed bar, and its value.
+
+    Plain Tk on purpose — the Game Analysis screen builds a dozen of these per
+    market row, and a canvas-backed frame per factor was pure overhead.
+    """
 
     def __init__(self, master, name: str, value: float, *, max_abs: float = 0.08,
                  description: str = "", unit: str = "pp", bg: str = T.BG_ELEV_2,
                  name_width: int = 170, bar_width: int = 160, informational: bool = False):
-        super().__init__(master, fg_color="transparent")
+        super().__init__(master, bg=bg, highlightthickness=0, bd=0)
         self._value, self._max = value, max(max_abs, 1e-6)
         self._informational = informational
-        name_lbl = ctk.CTkLabel(self, text=name, font=T.FONT_SMALL, text_color=T.TEXT if not informational else T.TEXT_MUTED,
-                                anchor="w", width=name_width)
+        name_lbl = tk.Label(self, text=name, font=T.FONT_SMALL, bg=bg, anchor="w", bd=0,
+                            highlightthickness=0,
+                            fg=(T.TEXT_MUTED if informational else T.TEXT))
+        name_lbl.configure(width=max(1, name_width // 7))
         name_lbl.pack(side="left")
-        self.canvas = tk.Canvas(self, width=bar_width, height=14, bg=bg, highlightthickness=0, bd=0)
+        self.canvas = tk.Canvas(self, width=bar_width, height=14, bg=bg, highlightthickness=0,
+                                bd=0, takefocus=0)
         self.canvas.pack(side="left", padx=T.SP_2)
-        color = T.TEXT_MUTED if informational else (T.POSITIVE if value > 0 else T.NEGATIVE if value < 0 else T.TEXT_MUTED)
+        color = T.TEXT_MUTED if informational else (
+            T.POSITIVE if value > 0 else T.NEGATIVE if value < 0 else T.TEXT_MUTED)
         text = "priced in" if informational else f"{value*100:+.1f} {unit}"
-        val_lbl = ctk.CTkLabel(self, text=text, font=T.FONT_MONO_SMALL, text_color=color, anchor="e", width=76)
+        val_lbl = tk.Label(self, text=text, font=T.FONT_MONO_SMALL, fg=color, bg=bg,
+                           anchor="e", width=11, bd=0, highlightthickness=0)
         val_lbl.pack(side="left")
         if description:
-            Tooltip(name_lbl, description)
-            Tooltip(val_lbl, description)
-        self.canvas.bind("<Configure>", lambda _e: self._render_bar())
+            from . import fastwidgets as _fw
+            _fw.tip(name_lbl, description)
+            _fw.tip(val_lbl, description)
         self._render_bar()
 
     def _render_bar(self):
         c = self.canvas
         c.delete("all")
-        w = max(c.winfo_width(), 40)
-        h = max(c.winfo_height(), 8)
+        w = int(c["width"])
+        h = int(c["height"])
         mid = w / 2
         c.create_rectangle(0, h / 2 - 3, w, h / 2 + 3, fill=T.BG_ELEV_4, outline="")
         c.create_line(mid, 0, mid, h, fill=T.BORDER_STRONG)

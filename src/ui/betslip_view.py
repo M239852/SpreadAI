@@ -7,6 +7,7 @@ from ..analysis import model as M
 from ..utils.formatters import format_american, format_pct, format_money
 from . import theme as T
 from .widgets import Card, Pill, StatBlock, ProbBar, GhostButton, IconButton, Tooltip, make_scroll, hsep
+from . import fastwidgets as fw
 from .state import AppState
 
 
@@ -17,6 +18,10 @@ class BetSlipPanel(ctk.CTkFrame):
         super().__init__(master, fg_color=T.BG_ELEV_1, corner_radius=0, width=T.SLIP_W)
         self.grid_propagate(False)
         self.state = state
+        self._rows: list["LegRow"] = []
+        self._placeholder = None
+        self._analysis_key: tuple | None = None
+        self._analysis: ParlayAnalysis | None = None
 
         # ---- header
         header = ctk.CTkFrame(self, fg_color="transparent")
@@ -89,7 +94,7 @@ class BetSlipPanel(ctk.CTkFrame):
         legs = self.state.bet_slip
         if not legs:
             return
-        analysis = analyze_parlay(legs)
+        analysis = self._parlay(legs)
         stake = self._kelly_stake(analysis)
         if stake > 0:
             self.stake_var.set(f"{stake:.0f}" if stake >= 10 else f"{stake:.2f}")
@@ -135,25 +140,32 @@ class BetSlipPanel(ctk.CTkFrame):
         self.verdict_lbl.pack(fill="x")
 
     def render(self):
-        for w in self.legs_scroll.winfo_children():
-            w.destroy()
         legs = self.state.bet_slip
         self.count_pill.set(str(len(legs)), variant=("accent" if legs else "neutral"))
+        for row in self._rows[len(legs):]:
+            row.pack_forget()
+        for i, leg in enumerate(legs):
+            if i < len(self._rows):
+                row = self._rows[i]
+            else:
+                row = LegRow(self.legs_scroll, self.state)
+                self._rows.append(row)
+            row.bind(leg)
+            if not row.winfo_manager():
+                row.pack(fill="x", pady=3, padx=4)
+        if self._placeholder is not None:
+            self._placeholder.destroy()
+            self._placeholder = None
         if not legs:
-            ctk.CTkLabel(
-                self.legs_scroll, text="◌", font=(T.FONT_FAMILY, 26), text_color=T.TEXT_DIM,
-            ).pack(pady=(T.SP_6, 0))
-            ctk.CTkLabel(
-                self.legs_scroll, text="Your slip is empty",
-                font=T.FONT_BOLD, text_color=T.TEXT_MUTED,
-            ).pack(pady=(T.SP_1, 0))
-            ctk.CTkLabel(
-                self.legs_scroll, text="Tap + on any line, tile or prop to add it here.",
-                font=T.FONT_TINY, text_color=T.TEXT_DIM,
-            ).pack()
-        else:
-            for leg in legs:
-                LegRow(self.legs_scroll, leg, self.state).pack(fill="x", pady=3, padx=4)
+            ph = fw.frame(self.legs_scroll, bg=T.BG_ELEV_1)
+            ph.pack(pady=(T.SP_6, 0))
+            fw.label(ph, "◌", bg=T.BG_ELEV_1, fg=T.TEXT_DIM, font=(T.FONT_FAMILY, 26),
+                     anchor="center").pack()
+            fw.label(ph, "Your slip is empty", bg=T.BG_ELEV_1, fg=T.TEXT_MUTED,
+                     font=T.FONT_BOLD, anchor="center").pack(pady=(T.SP_1, 0))
+            fw.label(ph, "Tap + on any line, tile or prop to add it here.", bg=T.BG_ELEV_1,
+                     fg=T.TEXT_DIM, font=T.FONT_TINY, anchor="center").pack()
+            self._placeholder = ph
         self._update_summary()
 
     def _kelly_stake(self, analysis: ParlayAnalysis) -> float:
@@ -162,9 +174,22 @@ class BetSlipPanel(ctk.CTkFrame):
         frac = analysis.kelly_conservative if M.current_settings().kelly_conservative else analysis.kelly_fraction
         return bankroll * frac * kelly_cap
 
+    def _parlay(self, legs) -> ParlayAnalysis:
+        """`analyze_parlay` cached on the leg set.
+
+        It runs a 6000-sample Gaussian copula, which is cheap once but not
+        cheap on every stake keystroke — and the stake does not change the
+        combined probability.
+        """
+        key = tuple((l.game_id, l.market, l.selection, l.price, l.model_prob) for l in legs)
+        if key != self._analysis_key or self._analysis is None:
+            self._analysis_key = key
+            self._analysis = analyze_parlay(list(legs))
+        return self._analysis
+
     def _update_summary(self):
         legs = self.state.bet_slip
-        analysis = analyze_parlay(legs)
+        analysis = self._parlay(legs)
 
         if not legs:
             for s in (self.stat_prob, self.stat_odds, self.stat_payout, self.stat_ev, self.stat_edge, self.stat_kelly):
@@ -261,40 +286,67 @@ class BetSlipPanel(ctk.CTkFrame):
 
 
 class LegRow(ctk.CTkFrame):
-    def __init__(self, master, leg: LegAnalysis, state: AppState):
-        super().__init__(master, fg_color=T.BG_ELEV_2, corner_radius=T.R_MD)
-        self.leg = leg
-        self.state = state
+    """One leg in the slip. Widgets are built once and rebound by `bind`.
 
-        inner = ctk.CTkFrame(self, fg_color="transparent")
+    Only the rounded shell is CustomTkinter; the contents are plain Tk from
+    `fastwidgets`, so adding a leg no longer rebuilds ~60 canvas-backed
+    widgets.
+    """
+
+    def __init__(self, master, state: AppState):
+        super().__init__(master, fg_color=T.BG_ELEV_2, corner_radius=T.R_MD)
+        self.state = state
+        self.leg: LegAnalysis | None = None
+        bg = T.BG_ELEV_2
+
+        inner = fw.frame(self, bg=bg)
         inner.pack(fill="x", padx=T.SP_3, pady=T.SP_2)
 
-        top = ctk.CTkFrame(inner, fg_color="transparent")
+        top = fw.frame(inner, bg=bg)
         top.pack(fill="x")
-        ctk.CTkLabel(
-            top, text=leg.selection, font=T.FONT_BOLD, text_color=T.TEXT,
-            anchor="w", wraplength=230, justify="left",
-        ).pack(side="left", fill="x", expand=True)
-        IconButton(top, "×", command=lambda: state.remove_leg(leg), width=24, height=24,
-                   hover_color=T.NEGATIVE_SOFT).pack(side="right")
-        ctk.CTkLabel(top, text=format_american(leg.price), font=T.FONT_BOLD, text_color=T.ACCENT).pack(side="right", padx=(0, 4))
+        self.remove_btn = fw.Button(top, "×", self._remove, bg=bg, fill=bg, hover=T.NEGATIVE_SOFT,
+                                    fg=T.TEXT_MUTED, width=24, height=24)
+        self.remove_btn.pack(side="right")
+        self.price = fw.label(top, "", bg=bg, fg=T.ACCENT, font=T.FONT_BOLD, anchor="e")
+        self.price.pack(side="right", padx=(0, 4))
+        self.selection = fw.label(top, "", bg=bg, fg=T.TEXT, font=T.FONT_BOLD,
+                                  wraplength=210, justify="left")
+        self.selection.pack(side="left", fill="x", expand=True)
 
-        ctk.CTkLabel(
-            inner, text=f"{leg.matchup}  ·  {leg.bookmaker}",
-            font=T.FONT_TINY, text_color=T.TEXT_MUTED, anchor="w",
-        ).pack(fill="x")
+        self.matchup = fw.label(inner, "", bg=bg, fg=T.TEXT_MUTED, font=T.FONT_TINY)
+        self.matchup.pack(fill="x")
 
-        bar = ProbBar(inner, height=14, bg=T.BG_ELEV_2)
-        bar.pack(fill="x", pady=(T.SP_1, 0))
-        bar.set(leg.model_prob, leg.prob_low, leg.prob_high, leg.book_implied)
+        self.bar = fw.ProbBar(inner, height=14, bg=bg)
+        self.bar.pack(fill="x", pady=(T.SP_1, 0))
 
-        metrics = ctk.CTkFrame(inner, fg_color="transparent")
+        metrics = fw.frame(inner, bg=bg)
         metrics.pack(fill="x", pady=(T.SP_1, 0))
-        Pill(metrics, f"Model {format_pct(leg.model_prob, 0)}", variant="model", font=T.FONT_TINY, height=20).pack(side="left", padx=(0, 4))
-        Pill(metrics, f"Edge {leg.edge*100:+.1f}%", variant=T.edge_variant(leg.edge), font=T.FONT_TINY, height=20).pack(side="left", padx=(0, 4))
+        self.model_pill = fw.Pill(metrics, "", bg=bg, variant="model", font=T.FONT_TINY, height=18)
+        self.model_pill.pack(side="left", padx=(0, 4))
+        self.edge_pill = fw.Pill(metrics, "", bg=bg, variant="neutral", font=T.FONT_TINY, height=18)
+        self.edge_pill.pack(side="left", padx=(0, 4))
+        self.conf_pill = fw.Pill(metrics, "", bg=bg, variant="neutral", font=T.FONT_TINY, height=18)
+        self.conf_pill.pack(side="left")
+        self._metrics = metrics
+
+    def _remove(self):
+        if self.leg is not None:
+            self.state.remove_leg(self.leg)
+
+    def bind(self, leg: LegAnalysis):
+        self.leg = leg
+        self.selection.configure(text=leg.selection)
+        self.price.configure(text=format_american(leg.price))
+        self.matchup.configure(text=f"{leg.matchup}  ·  {leg.bookmaker}")
+        self.bar.set(leg.model_prob, leg.prob_low, leg.prob_high, leg.book_implied)
+        self.model_pill.set(f"Model {format_pct(leg.model_prob, 0)}", variant="model")
+        self.edge_pill.set(f"Edge {leg.edge*100:+.1f}%", variant=T.edge_variant(leg.edge))
         if leg.confidence:
-            Pill(metrics, f"{leg.confidence*100:.0f}% conf", variant="neutral", font=T.FONT_TINY, height=20,
-                 text_color=T.confidence_color(leg.confidence)).pack(side="left")
-        Tooltip(metrics, f"Book implied {leg.book_implied*100:.1f}% at {leg.bookmaker}")
-        if leg.notes:
-            Tooltip(bar, "\n".join(leg.notes))
+            self.conf_pill.set(f"{leg.confidence*100:.0f}% conf", variant="neutral",
+                               fg=T.confidence_color(leg.confidence))
+            if not self.conf_pill.winfo_manager():
+                self.conf_pill.pack(side="left")
+        elif self.conf_pill.winfo_manager():
+            self.conf_pill.pack_forget()
+        fw.tip(self._metrics, f"Book implied {leg.book_implied*100:.1f}% at {leg.bookmaker}")
+        fw.tip(self.bar, "\n".join(leg.notes))
