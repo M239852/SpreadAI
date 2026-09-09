@@ -32,7 +32,8 @@ probability engine, and where to extend it.
    no widgets, no threads, no network calls except the explicit research
    fetchers. It is unit-tested in isolation (`tests/`).
 4. **The UI thread owns the widgets.** Network work runs on daemon threads and
-   results are marshalled back with `widget.after(0, …)`.
+   results are marshalled back through one queue (`runtime.ui_call`) that the
+   Tk main loop drains; workers never touch Tk.
 5. **Degrade gracefully.** Missing key → demo odds. Feed down → demo props.
    Research fetch fails → empty research, the market prior still prices the
    leg.
@@ -100,6 +101,8 @@ caller.
 | `main.py` | Entry point; friendly failure if CustomTkinter is missing | `main()` |
 | `src/ui/app.py` | Root window, grouped sidebar (collapsible), top command bar (sport picker, LIVE/DEMO pill, refresh, slip toggle), view stack, keyboard shortcuts, 60 s auto-refresh, config → model settings | `App`, `NAV_GROUPS`, `AUTO_REFRESH_MS` |
 | `src/ui/theme.py` | Design tokens: palette (strong/soft semantic pairs), type scale, spacing, radii, layout metrics, color helpers | `ACCENT`, `MODEL`, `edge_color()`, `variant_colors()` |
+| `src/ui/fastwidgets.py` | Plain-Tk primitives used for all dense, repeated content: `frame`, `label`, `Pill`, `Button`, `StatBlock`, `ProbBar`, shared `tip()` tooltip. Rounded fills come from a cached rounded-rectangle image rather than a per-widget canvas redraw | `rounded_image()`, `measure()` |
+| `src/ui/runtime.py` | Main-thread queue (`ui_call` / `start_pump`), `run_in_thread`, `LazyRenderMixin`, `render_chunked` | |
 | `src/ui/widgets.py` | Widget kit: `Card`, `Pill`, `StatBlock`, `Segmented`, `PageHeader` (title + source pill + banner), `Toolbar`, `EmptyState`, `Tooltip`, canvas visuals `ProbBar`, `FactorBar`, `Sparkline`, themed `ttk.Treeview` via `make_tree()` | |
 | `src/ui/state.py` | Shared state + observer bus | `AppState.subscribe/notify`, `add_leg/remove_leg/clear_slip` |
 | `src/ui/games_view.py` | Board: per-game cards, best price + model % + edge per line, search/sort/+EV filter | `GamesView`, `GameCard` |
@@ -153,15 +156,17 @@ sequenceDiagram
     else no key
         W->>W: demo_games(sport)
     end
-    W->>App: after(0, _on_games_loaded)
+    W->>App: ui_call(_on_games_loaded) — queued, drained on the Tk thread
+    App->>App: fingerprint prices; skip notify if unchanged (auto tick)
     App->>S: games, games_source
     S->>V: notify("games")
-    V->>V: render() — Board, Markets, Analyzer, Team Slip re-price every selection
+    V->>V: visible view renders now (chunked); hidden views mark dirty
 ```
 
 The auto-refresh tick fires every 60 s but only calls the API when a key is
 configured, and `get_odds` serves the 120 s cache first, so a live session
-hits The Odds API at most every two minutes per sport.
+hits The Odds API at most every two minutes per sport. A tick whose prices
+match the previous pull updates the status line and re-renders nothing.
 
 ### 3.2 Pricing a leg (Board, Markets, Analyzer, Team Slip)
 
@@ -211,12 +216,16 @@ product; otherwise standard parlay odds.
 
 | Rule | Where |
 | --- | --- |
-| Tk main loop is the only thread that touches widgets. | all views |
-| Every network fetch runs in `threading.Thread(daemon=True)`. | `App.refresh_games`, `AnalysisView.show_game`, `PropsView._load/_analyze_all`, both generators |
-| Results return via `widget.after(0, callback)`. | same |
+| Tk main loop is the only thread that touches widgets — workers never call Tk, not even `after`. | all views |
+| Every network fetch runs on a daemon thread (`runtime.run_in_thread` or `threading.Thread`). | `App.refresh_games`, `AnalysisView.show_game`, `PropsView._load/_analyze_all`, both generators |
+| Results return via `runtime.ui_call(fn, …)`: one queue drained every 30 ms by the main loop (`start_pump`). Failures are logged to `.cache/spreadai.log`. | same |
+| A refresh in flight blocks a second one; a result for a sport the user has since left is dropped. | `App.refresh_games` (`_refreshing`), `_on_games_loaded` |
+| Hidden views don't re-render on `games`/`sport`; they mark themselves dirty and render when shown. | `runtime.LazyRenderMixin` — Board, Markets, Analyzer, Team Slip |
+| Long card lists are built a few per event-loop tick; a new render cancels an in-flight one. | `runtime.render_chunked` — Board, Markets, Team Slip |
 | Stale-result guard: the callback checks the view is still showing the same target before rendering. | `AnalysisView._on_research_ready` (`_current_game_id`) |
 | Long analyses report progress through a callback that itself hops to the UI thread. | generators (`progress_cb`) |
 | Background prop analysis repopulates the table every 25 rows and caps work at `ANALYZE_LIMIT = 200` visible props. | `PropsView._analyze_all` |
+| The parlay copula is cached on the leg set, so typing a stake does not re-run it. | `BetSlipPanel._parlay` |
 
 The engine's Monte Carlo (6 000 copula samples, seeded) runs synchronously on
 the UI thread inside `analyze_parlay`; at ≤ 8 legs this is well under 100 ms.
@@ -381,9 +390,49 @@ can show how much correlation moved the number.
   Probability visuals are canvas widgets: `ProbBar` (interval band, model
   dot, book tick), `FactorBar` (signed contribution), `Sparkline` (samples vs
   line). Large lists use `make_tree` (themed, virtualized `ttk.Treeview`).
-* **Rendering strategy.** Views destroy and rebuild their card lists on each
-  `games`/`sport` event; the Board pre-computes all six legs per game once and
+* **Rendering strategy.** See §6.1. Views re-render only while visible, only
+  when the pull actually changed prices, and rebind pooled cards rather than
+  rebuilding them. The Board pre-computes all six legs per game once and
   reuses them for sorting, filtering and cards.
+
+### 6.1 Performance model
+
+CustomTkinter gives every widget its own `tk.Canvas` and redraws a rounded
+rectangle on it. That is fine for chrome and ruinous for dense lists: the
+Board alone issued ~1000 rounded-rect draws per render, which dominated the
+frame budget on macOS and low-end machines, where each Tcl round-trip is
+expensive. Four rules keep the app fluid:
+
+1. **Lazy views.** Only the Board is constructed at startup; the other eight
+   screens are built the first time they are shown (`App.view`).
+2. **Fast primitives.** Rounded *containers* (card shells, market panels,
+   tiles) stay CustomTkinter — a plain frame cannot mask its own square
+   corners. Everything inside them is plain Tk from `fastwidgets`, with pills
+   and small buttons painted from a rounded-rectangle image cached by
+   (width, height, radius, color). `tk.Button` is deliberately avoided: macOS
+   Aqua ignores its background color, so buttons are labels with bindings.
+3. **Pooling.** Board, Markets, Team Slip and the bet slip keep a pool of
+   cards/rows and rebind them to new data; a re-render creates no widgets.
+4. **Chunked first build.** The initial build of a long list runs a few cards
+   per event-loop tick, so a large slate never freezes the window.
+
+Measured on the 10-game NFL demo slate (Linux, Xvfb, Python 3.12):
+
+| Operation | Before | After |
+| --- | ---: | ---: |
+| `App()` construction | 1861 ms | 408 ms |
+| Board first render | 1465 ms | 486 ms |
+| Board re-render (refresh / filter / sort) | 2254 ms | 77 ms |
+| Markets first open | 2179 ms | 838 ms |
+| Team Slip first open | 1981 ms | 717 ms |
+| Game Analysis first open | 1014 ms | 391 ms |
+| Add 3 legs to the slip | 447 ms | 231 ms |
+| Stake keystroke | 27 ms | 14 ms |
+| Widgets created at startup | 1322 | 329 |
+
+Pricing was never the bottleneck: the whole Board costs ~6 ms of model
+math. The remaining first-open costs are widget creation, spread across
+event-loop ticks so the window stays responsive.
 
 ---
 

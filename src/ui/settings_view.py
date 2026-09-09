@@ -8,6 +8,7 @@ from ..utils.storage import save_config
 from . import theme as T
 from .widgets import Card, PageHeader, PrimaryButton, GhostButton, entry, switch, checkbox, make_scroll, section_label
 from .state import AppState
+from . import fastwidgets as fw
 
 
 class SettingsView(ctk.CTkFrame):
@@ -100,16 +101,18 @@ class SettingsView(ctk.CTkFrame):
 
         sports = ctk.CTkFrame(inner, fg_color=T.BG_ELEV_2, corner_radius=T.R_MD)
         sports.pack(fill="x", pady=(T.SP_3, 0))
-        grid = ctk.CTkFrame(sports, fg_color="transparent")
+        grid = fw.frame(sports, bg=T.BG_ELEV_2)
         grid.pack(fill="x", padx=T.SP_3, pady=T.SP_2)
         heads = ("Sport", "Margin σ", "Total σ", "Efficiency", "Fav–Over ρ", "Prop prior n", "Cross-market")
         for c, h in enumerate(heads):
-            ctk.CTkLabel(grid, text=h.upper(), font=T.FONT_LABEL, text_color=T.TEXT_MUTED, anchor="w", width=110).grid(row=0, column=c, sticky="w", padx=4)
+            fw.label(grid, h.upper(), bg=T.BG_ELEV_2, fg=T.TEXT_MUTED, font=T.FONT_LABEL,
+                     width=14).grid(row=0, column=c, sticky="w", padx=4)
         for r, sp in enumerate(M.SPORTS.values(), start=1):
-            vals = (sp.label, f"{sp.margin_sd:g}", f"{sp.total_sd:g}", f"{sp.efficiency*100:.0f}%", f"{sp.fav_over_corr:+.2f}",
-                    f"{sp.prop_prior_n:g}", "yes" if sp.cross_market else "no")
+            vals = (sp.label, f"{sp.margin_sd:g}", f"{sp.total_sd:g}", f"{sp.efficiency*100:.0f}%",
+                    f"{sp.fav_over_corr:+.2f}", f"{sp.prop_prior_n:g}", "yes" if sp.cross_market else "no")
             for c, v in enumerate(vals):
-                ctk.CTkLabel(grid, text=v, font=(T.FONT_MONO_SMALL if c else T.FONT_SMALL), text_color=T.TEXT, anchor="w", width=110).grid(row=r, column=c, sticky="w", padx=4)
+                fw.label(grid, v, bg=T.BG_ELEV_2, fg=T.TEXT, width=14,
+                         font=(T.FONT_MONO_SMALL if c else T.FONT_SMALL)).grid(row=r, column=c, sticky="w", padx=4)
 
     def _build_about_section(self):
         inner = self._section("About",

@@ -13,7 +13,9 @@ from ..utils.formatters import format_american, format_pct, format_game_time, fo
 from . import theme as T
 from .widgets import (Card, Pill, StatBlock, ProbBar, FactorBar, PrimaryButton, GhostButton,
                       EmptyState, Tooltip, make_scroll, section_label)
+from . import fastwidgets as fw
 from .state import AppState
+from .runtime import ui_call
 
 
 class AnalysisView(ctk.CTkFrame):
@@ -54,7 +56,7 @@ class AnalysisView(ctk.CTkFrame):
                 r = research_game(game)
             except Exception:
                 r = empty_research(game)
-            self.after(0, lambda: self._on_research_ready(game, r, loading))
+            ui_call(self._on_research_ready, game, r, loading)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -236,70 +238,78 @@ class AnalysisView(ctk.CTkFrame):
 
 
 class MarketRow(ctk.CTkFrame):
-    """One market selection: price, probability bar, stats and the model breakdown."""
+    """One market selection: price, probability bar, stats and the model breakdown.
+
+    The rounded shell is CustomTkinter; everything inside is plain Tk, which
+    matters because this view builds six of these plus their factor bars.
+    """
 
     def __init__(self, master, game: Game, research: GameResearch, label: str, market_key: str,
                  selection: str, on_add: Callable[[LegAnalysis], None]):
         super().__init__(master, fg_color=T.BG_ELEV_2, corner_radius=T.R_MD)
+        bg = T.BG_ELEV_2
         factors = build_factors_for_selection(game, research, market_key, selection)
         leg = build_leg_analysis(game, market_key, selection, factors)
 
-        inner = ctk.CTkFrame(self, fg_color="transparent")
+        inner = fw.frame(self, bg=bg)
         inner.pack(fill="x", padx=T.SP_4, pady=T.SP_3)
 
-        top = ctk.CTkFrame(inner, fg_color="transparent")
+        top = fw.frame(inner, bg=bg)
         top.pack(fill="x")
-        lbl_col = ctk.CTkFrame(top, fg_color="transparent")
+        lbl_col = fw.frame(top, bg=bg)
         lbl_col.pack(side="left", fill="x", expand=True)
-        display = leg.selection if leg else label
-        ctk.CTkLabel(lbl_col, text=display, font=T.FONT_SUB, text_color=T.TEXT, anchor="w").pack(anchor="w")
+        fw.label(lbl_col, leg.selection if leg else label, bg=bg, fg=T.TEXT, font=T.FONT_SUB).pack(anchor="w")
         if leg:
-            ctk.CTkLabel(lbl_col, text=f"{label}   ·   best {format_american(leg.price)} @ {leg.bookmaker}",
-                         font=T.FONT_TINY, text_color=T.TEXT_MUTED, anchor="w").pack(anchor="w", pady=(2, 0))
+            fw.label(lbl_col, f"{label}   ·   best {format_american(leg.price)} @ {leg.bookmaker}",
+                     bg=bg, fg=T.TEXT_MUTED, font=T.FONT_TINY).pack(anchor="w", pady=(2, 0))
         if leg is None:
-            ctk.CTkLabel(top, text="No data", font=T.FONT_SMALL, text_color=T.TEXT_DIM).pack(side="right")
+            fw.label(top, "No data", bg=bg, fg=T.TEXT_DIM, font=T.FONT_SMALL).pack(side="right")
             return
 
-        PrimaryButton(top, "Add to slip", command=lambda: on_add(leg), width=110, height=32).pack(side="right")
-        stats = ctk.CTkFrame(top, fg_color="transparent")
+        fw.Button(top, "Add to slip", lambda: on_add(leg), bg=bg, fill=T.ACCENT, hover=T.ACCENT_HOVER,
+                  fg=T.ACCENT_TEXT, width=110, height=32).pack(side="right")
+        stats = fw.frame(top, bg=bg)
         stats.pack(side="right", padx=(0, T.SP_4))
-        StatBlock(stats, "Book", format_pct(leg.book_implied)).pack(side="left", padx=T.SP_2)
-        StatBlock(stats, "Consensus", format_pct(leg.fair_implied)).pack(side="left", padx=T.SP_2)
-        StatBlock(stats, "Model", format_pct(leg.model_prob), value_color=T.edge_color(leg.edge),
-                  sub=f"{leg.prob_low*100:.0f}–{leg.prob_high*100:.0f}%").pack(side="left", padx=T.SP_2)
-        StatBlock(stats, "Edge", f"{leg.edge*100:+.1f}%", value_color=T.edge_color(leg.edge)).pack(side="left", padx=T.SP_2)
-        StatBlock(stats, "EV / $1", format_money(leg.ev_per_dollar), value_color=T.edge_color(leg.ev_per_dollar)).pack(side="left", padx=T.SP_2)
-        StatBlock(stats, "Conf", f"{leg.confidence*100:.0f}%", value_color=T.confidence_color(leg.confidence)).pack(side="left", padx=T.SP_2)
+        for lbl_text, value, color, sub in (
+            ("Book", format_pct(leg.book_implied), T.TEXT, ""),
+            ("Consensus", format_pct(leg.fair_implied), T.TEXT, ""),
+            ("Model", format_pct(leg.model_prob), T.edge_color(leg.edge),
+             f"{leg.prob_low*100:.0f}–{leg.prob_high*100:.0f}%"),
+            ("Edge", f"{leg.edge*100:+.1f}%", T.edge_color(leg.edge), ""),
+            ("EV / $1", format_money(leg.ev_per_dollar), T.edge_color(leg.ev_per_dollar), ""),
+            ("Conf", f"{leg.confidence*100:.0f}%", T.confidence_color(leg.confidence), ""),
+        ):
+            fw.StatBlock(stats, lbl_text, value, bg=bg, value_color=color, sub=sub).pack(side="left", padx=T.SP_2)
 
-        bar = ProbBar(inner, height=16, bg=T.BG_ELEV_2)
+        bar = fw.ProbBar(inner, height=16, bg=bg)
         bar.pack(fill="x", pady=(T.SP_2, 0))
         bar.set(leg.model_prob, leg.prob_low, leg.prob_high, leg.book_implied)
-        Tooltip(bar, "\n".join(leg.notes))
+        fw.tip(bar, "\n".join(leg.notes))
 
         # --- Breakdown: how the probability was built ---
-        breakdown = ctk.CTkFrame(inner, fg_color="transparent")
+        breakdown = fw.frame(inner, bg=bg)
         breakdown.pack(fill="x", pady=(T.SP_2, 0))
-        ctk.CTkLabel(breakdown, text="BREAKDOWN", font=T.FONT_LABEL, text_color=T.TEXT_DIM).pack(anchor="w")
+        fw.label(breakdown, "BREAKDOWN", bg=bg, fg=T.TEXT_DIM, font=T.FONT_LABEL).pack(anchor="w")
 
-        # Market-structure steps (consensus → cross-market/line shift → prior).
         FactorBar(breakdown, f"Consensus  {leg.fair_implied*100:.1f}%", 0.0, informational=True,
-                  description=leg.notes[0] if leg.notes else "").pack(anchor="w")
+                  bg=bg, description=leg.notes[0] if leg.notes else "").pack(anchor="w")
         structural = leg.prior_prob - leg.fair_implied
         if abs(structural) > 0.0005:
             src = "Cross-market + line shift" if leg.cross_prob is not None else "Line shift"
             desc = "\n".join(n for n in leg.notes if "→" in n or "shift" in n.lower())
-            FactorBar(breakdown, src, structural, description=desc).pack(anchor="w")
+            FactorBar(breakdown, src, structural, bg=bg, description=desc).pack(anchor="w")
 
-        # Research evidence, attributed proportionally to the realized move.
         realized = leg.model_prob - leg.prior_prob
         raw = sum(f.contribution for f in leg.adjustments)
         for f in leg.adjustments:
             if f.scale == 0.0:
-                FactorBar(breakdown, f.name, 0.0, informational=True, description=f.description).pack(anchor="w")
+                FactorBar(breakdown, f.name, 0.0, informational=True, bg=bg,
+                          description=f.description).pack(anchor="w")
                 continue
             share = (f.contribution / raw) if abs(raw) > 1e-9 else 0.0
-            FactorBar(breakdown, f.name, realized * share,
-                      description=f"{f.description}\nsignal {f.weight:+.2f} × scale {f.scale:.2f} × confidence {f.confidence:.2f}").pack(anchor="w")
+            FactorBar(breakdown, f.name, realized * share, bg=bg,
+                      description=f"{f.description}\nsignal {f.weight:+.2f} × scale {f.scale:.2f} "
+                                  f"× confidence {f.confidence:.2f}").pack(anchor="w")
         if leg.push_prob > 0.005:
-            ctk.CTkLabel(breakdown, text=f"Whole-number line — ~{leg.push_prob*100:.1f}% push probability (refund).",
-                         font=T.FONT_TINY, text_color=T.TEXT_DIM, anchor="w").pack(anchor="w", pady=(2, 0))
+            fw.label(breakdown, f"Whole-number line — ~{leg.push_prob*100:.1f}% push probability (refund).",
+                     bg=bg, fg=T.TEXT_DIM, font=T.FONT_TINY).pack(anchor="w", pady=(2, 0))

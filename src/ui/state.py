@@ -1,5 +1,6 @@
 """Shared app state: bet slip, current games, etc."""
 from __future__ import annotations
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -29,7 +30,10 @@ class AppState:
             try:
                 fn(event)
             except Exception:
-                pass
+                # Never let one view's failure block the others, but never
+                # hide it either — a silent failure looks like a stuck screen.
+                logging.getLogger("spreadai.state").exception(
+                    "observer %r failed on event %r", getattr(fn, "__qualname__", fn), event)
 
     def add_leg(self, leg: LegAnalysis):
         for existing in self.bet_slip:

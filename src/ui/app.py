@@ -1,7 +1,9 @@
 """Application shell: sidebar navigation, top command bar, view stack, bet slip drawer."""
 from __future__ import annotations
-import threading
+import logging
+import time
 from datetime import datetime
+from typing import Callable
 import customtkinter as ctk
 
 from ..api.odds_api import OddsAPI, SPORT_LABELS
@@ -11,6 +13,7 @@ from ..utils.storage import load_config, save_config
 from . import theme as T
 from .widgets import Pill, Segmented, IconButton, PrimaryButton, GhostButton, Tooltip, install_treeview_styles
 from .state import AppState
+from .runtime import start_pump, run_in_thread
 from .games_view import GamesView
 from .analysis_view import AnalysisView
 from .betslip_view import BetSlipPanel
@@ -23,8 +26,12 @@ from .team_slip_view import TeamSlipView
 from .prop_generator_view import PropGeneratorView
 
 
+log = logging.getLogger("spreadai.app")
+
 # Auto-refresh cadence for live odds polling. The Odds API rate-limits the
-# free tier but 60s is well inside the quota for a single-sport pull.
+# free tier but 60s is well inside the quota for a single-sport pull. The
+# client caches for 120 s and the app only re-renders when prices changed,
+# so a tick that finds nothing new costs a cache read and a status update.
 AUTO_REFRESH_MS = 60_000
 
 # Navigation, grouped. (key, label, icon, shortcut digit)
@@ -64,13 +71,21 @@ class App(ctk.CTk):
         self._slip_visible = True
         self._current_view = "games"
         self._last_refresh: datetime | None = None
+        self._refreshing = False
+        self._games_fingerprint: tuple | None = None
 
         self._build_layout()
         self._bind_shortcuts()
         self.state_.subscribe(self._on_state_event)
 
+        # All worker-thread results come back through one queue drained here.
+        start_pump(self)
         self.after(200, self.refresh_games)
         self._schedule_auto_refresh()
+
+    def report_callback_exception(self, exc, val, tb):
+        """Tk calls this for exceptions inside event callbacks; log instead of printing."""
+        log.error("Tk callback failed", exc_info=(exc, val, tb))
 
     # ================================================================ layout
 
@@ -262,43 +277,98 @@ class App(ctk.CTk):
     # ---------------------------------------------------------------- views
 
     def _build_main_views(self):
+        """Register view factories; each screen is constructed on first use.
+
+        Building all nine views up front cost roughly two seconds of widget
+        creation before the window could paint. Only the Board is needed at
+        startup, so the rest are constructed the first time they are shown and
+        cached from then on.
+        """
+        self._view_factories: dict[str, Callable[[], ctk.CTkFrame]] = {
+            "games":          lambda: GamesView(self.main, self.state_, self._add_leg, self._view_analysis),
+            "markets":        lambda: MarketsView(self.main, self.state_, self._add_leg),
+            "analyzer":       lambda: AnalyzerView(self.main, self.state_, self._add_leg),
+            "team_slip":      lambda: TeamSlipView(self.main, self.state_, self._add_leg),
+            "props":          lambda: PropsView(self.main, self.state_, self._add_leg),
+            "prop_generator": lambda: PropGeneratorView(self.main, self.state_, self._add_leg),
+            "generator":      lambda: GeneratorView(self.main, self.state_, self._add_leg),
+            "analysis":       lambda: AnalysisView(self.main, self.state_, self._add_leg),
+            "settings":       lambda: SettingsView(self.main, self.state_, self._on_settings_saved),
+        }
         self.views: dict[str, ctk.CTkFrame] = {}
-
-        self.games_view = GamesView(self.main, self.state_, self._add_leg, self._view_analysis)
-        self.views["games"] = self.games_view
-        self.markets_view = MarketsView(self.main, self.state_, self._add_leg)
-        self.views["markets"] = self.markets_view
-        self.analyzer_view = AnalyzerView(self.main, self.state_, self._add_leg)
-        self.views["analyzer"] = self.analyzer_view
-        self.team_slip_view = TeamSlipView(self.main, self.state_, self._add_leg)
-        self.views["team_slip"] = self.team_slip_view
-        self.props_view = PropsView(self.main, self.state_, self._add_leg)
-        self.views["props"] = self.props_view
-        self.prop_generator_view = PropGeneratorView(self.main, self.state_, self._add_leg)
-        self.views["prop_generator"] = self.prop_generator_view
-        self.generator_view = GeneratorView(self.main, self.state_, self._add_leg)
-        self.views["generator"] = self.generator_view
-        self.analysis_view = AnalysisView(self.main, self.state_, self._add_leg)
-        self.views["analysis"] = self.analysis_view
-        self.settings_view = SettingsView(self.main, self.state_, self._on_settings_saved)
-        self.views["settings"] = self.settings_view
-
-        for v in self.views.values():
-            v.grid(row=0, column=0, sticky="nsew")
-            v.grid_remove()
-
         self.show("games")
         self._update_slip_button()
 
+    def view(self, key: str):
+        """Return a view, constructing it the first time it is asked for."""
+        v = self.views.get(key)
+        if v is None:
+            factory = self._view_factories.get(key)
+            if factory is None:
+                return None
+            t0 = time.perf_counter()
+            v = factory()
+            v.grid(row=0, column=0, sticky="nsew")
+            v.grid_remove()
+            self.views[key] = v
+            log.debug("built view %r in %.0f ms", key, (time.perf_counter() - t0) * 1000)
+        return v
+
+    # Views the rest of the app reaches for by name; each builds on demand.
+    @property
+    def games_view(self):
+        return self.view("games")
+
+    @property
+    def analysis_view(self):
+        return self.view("analysis")
+
+    @property
+    def props_view(self):
+        return self.view("props")
+
+    @property
+    def generator_view(self):
+        return self.view("generator")
+
+    @property
+    def prop_generator_view(self):
+        return self.view("prop_generator")
+
+    @property
+    def team_slip_view(self):
+        return self.view("team_slip")
+
+    @property
+    def markets_view(self):
+        return self.view("markets")
+
+    @property
+    def analyzer_view(self):
+        return self.view("analyzer")
+
+    @property
+    def settings_view(self):
+        return self.view("settings")
+
     def show(self, key: str):
-        if key not in self.views:
+        if key not in self._view_factories:
             return
+        target = self.view(key)
+        if target is None:
+            return
+        previous = self.views.get(self._current_view)
         self._current_view = key
         for k, v in self.views.items():
             if k == key:
                 v.grid()
             else:
                 v.grid_remove()
+        # Hidden views skip re-rendering; the one being shown catches up.
+        if previous is not None and previous is not target and hasattr(previous, "on_hidden"):
+            previous.on_hidden()
+        if hasattr(target, "on_shown"):
+            target.on_shown()
         for k, b in self.nav_buttons.items():
             if k == key:
                 b.configure(fg_color=T.ACCENT_SOFT, text_color=T.ACCENT)
@@ -328,12 +398,23 @@ class App(ctk.CTk):
         save_config(self.state_.config)
         self.sport_seg.set(key)
         self.state_.notify("sport")
+        self._refreshing = False      # a stale in-flight pull is dropped on arrival
         self.refresh_games()
 
     # ---------------------------------------------------------------- actions
 
-    def refresh_games(self):
-        self.status_lbl.configure(text="Loading…", text_color=T.TEXT_MUTED)
+    def refresh_games(self, quiet: bool = False):
+        """Pull odds on a worker thread and hand the result to the UI thread.
+
+        `quiet` is used by the auto-refresh tick: no "Loading…" flash, and if
+        the prices did not change nothing is re-rendered.
+        """
+        if self._refreshing:
+            log.debug("refresh already in flight — ignored")
+            return
+        self._refreshing = True
+        if not quiet:
+            self.status_lbl.configure(text="Loading…", text_color=T.TEXT_MUTED)
         self.refresh_btn.configure(state="disabled")
         sport = self.state_.sport_key
         cfg = self.state_.config
@@ -361,21 +442,47 @@ class App(ctk.CTk):
                     games = demo_games(sport)
                     source = "demo"
             except Exception as e:
+                log.warning("odds fetch failed: %s", e)
                 err = f"Failed to fetch odds: {e}"
                 if use_demo:
                     games = demo_games(sport)
                 source = "demo"
+            return games, err, source, sport, quiet
 
-            self.after(0, lambda: self._on_games_loaded(games, err, source))
+        run_in_thread(work, on_done=lambda r: self._on_games_loaded(*r),
+                      on_error=self._on_refresh_error, name="odds-refresh")
 
-        threading.Thread(target=work, daemon=True).start()
+    def _on_refresh_error(self, exc: BaseException):
+        self._refreshing = False
+        self.refresh_btn.configure(state="normal")
+        self.status_lbl.configure(text=f"Refresh failed: {exc}", text_color=T.NEGATIVE)
 
-    def _on_games_loaded(self, games, err: str, source: str = "demo"):
+    @staticmethod
+    def _fingerprint(games) -> tuple:
+        """Cheap identity of a slate: every (game, book, market, outcome, price, point)."""
+        return tuple(sorted(
+            (g.id, bk.key, m.key, o.name, o.price, o.point)
+            for g in games for bk in g.bookmakers for m in bk.markets for o in m.outcomes
+        ))
+
+    def _on_games_loaded(self, games, err: str, source: str = "demo", sport: str | None = None, quiet: bool = False):
+        self._refreshing = False
+        self.refresh_btn.configure(state="normal")
+        if sport is not None and sport != self.state_.sport_key:
+            log.info("dropping stale refresh for %s (now on %s)", sport, self.state_.sport_key)
+            return
+
+        fingerprint = self._fingerprint(games)
+        changed = fingerprint != self._games_fingerprint or source != self.state_.games_source
+        self._games_fingerprint = fingerprint
         self.state_.games = games
         self.state_.games_source = source
         self._last_refresh = datetime.now()
-        self.state_.notify("games")
-        self.refresh_btn.configure(state="normal")
+        if changed or not quiet:
+            self.state_.notify("games")
+        else:
+            log.debug("auto-refresh: prices unchanged, skipped re-render")
+
         label = SPORT_LABELS.get(self.state_.sport_key, self.state_.sport_key)
         stamp = self._last_refresh.strftime("%H:%M")
         if err:
@@ -411,8 +518,8 @@ class App(ctk.CTk):
         self._auto_refresh_job = self.after(AUTO_REFRESH_MS, self._auto_refresh_tick)
 
     def _auto_refresh_tick(self):
-        if self.state_.config.get("odds_api_key"):
-            self.refresh_games()
+        if self.state_.config.get("odds_api_key") and not self._refreshing:
+            self.refresh_games(quiet=True)
         self._schedule_auto_refresh()
 
     def _cancel_auto_refresh(self):

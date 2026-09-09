@@ -16,6 +16,7 @@ from ..analysis.probability import LegAnalysis
 from . import theme as T
 from .widgets import PageHeader, Toolbar, PrimaryButton, GhostButton, Sparkline, StatBlock, Tooltip, entry, option_menu, checkbox, make_tree
 from .state import AppState
+from .runtime import ui_call
 
 ANALYZE_LIMIT = 200
 
@@ -219,7 +220,7 @@ class PropsView(ctk.CTkFrame):
             if not props:
                 props = demo_props(sport_key)
                 src = "Demo"
-            self.after(0, lambda: self._on_props_loaded(props, src))
+            ui_call(self._on_props_loaded, props, src)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -261,9 +262,9 @@ class PropsView(ctk.CTkFrame):
                 analysis = analyze_prop(p, skip_network=True)
             self._analyses[p.id] = analysis
             if (i + 1) % 25 == 0:
-                self.after(0, self._populate_tree)
-        self.after(0, self._populate_tree)
-        self.after(0, self._on_tree_select)
+                ui_call(self._populate_tree)
+        ui_call(self._populate_tree)
+        ui_call(self._on_tree_select)
 
     # ---------------------------------------------------------------- table
 

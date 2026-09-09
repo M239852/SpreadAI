@@ -11,6 +11,7 @@ from . import theme as T
 from .widgets import (Card, Pill, StatBlock, PageHeader, Segmented, PrimaryButton, ProbBar, EmptyState,
                       Tooltip, option_menu, switch, slider, make_scroll, section_label)
 from .state import AppState
+from .runtime import ui_call
 
 SLIP_COUNT_CHOICES = (1, 2, 3, 4, 5)
 
@@ -144,7 +145,7 @@ class GeneratorView(ctk.CTkFrame):
         loading.pack(pady=T.SP_6)
 
         def progress_cb(done: int, total: int, note: str):
-            self.after(0, lambda: self.progress_lbl.configure(text=f"{done}/{total} — {note}", text_color=T.TEXT_MUTED))
+            ui_call(self.progress_lbl.configure, text=f"{done}/{total} — {note}", text_color=T.TEXT_MUTED)
 
         book, slip_count, dedupe, mode, max_legs = self.bookmaker_filter, self.slip_count, self.dedupe_legs, self.mode, self.max_legs
 
@@ -156,7 +157,7 @@ class GeneratorView(ctk.CTkFrame):
                                        dedupe_legs=dedupe, progress_cb=progress_cb, bookmaker_filter=book)
             except Exception as e:
                 err = f"Generation failed: {e}"
-            self.after(0, lambda: self._on_generated(slips, err, loading))
+            ui_call(self._on_generated, slips, err, loading)
 
         threading.Thread(target=work, daemon=True).start()
 
